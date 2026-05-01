@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: mt5_quant_trader_v2
+Version: 0.1.0
+Summary: Production-grade MT5 quant research — rebuilt with rigor
+Requires-Python: >=3.11
+Requires-Dist: numpy>=1.26
+Requires-Dist: pandas>=2.1
+Requires-Dist: pyarrow>=14
+Requires-Dist: pyyaml>=6
+Requires-Dist: pydantic>=2.5
+Requires-Dist: matplotlib>=3.8
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: pytest-cov>=4; extra == "dev"
+Requires-Dist: hypothesis>=6.92; extra == "dev"
+Requires-Dist: ruff>=0.1; extra == "dev"

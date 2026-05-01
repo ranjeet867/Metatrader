@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mt5_quant_trader_v2"
+version = "0.1.0"
+description = "Production-grade MT5 quant research — rebuilt with rigor"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pyarrow>=14",
+    "pyyaml>=6",
+    "pydantic>=2.5",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=4",
+    "hypothesis>=6.92",   # property-based testing
+    "ruff>=0.1",
+]
+
+# Explicit package list — DO NOT use autodiscovery, it will pick up data/ etc.
+[tool.setuptools]
+packages = ["core", "strategies"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: tests that take > 5 seconds",
+    "integration: tests that need real data",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

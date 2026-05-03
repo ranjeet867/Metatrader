@@ -7,4 +7,3 @@ __pycache__/
 .coverage
 htmlcov/
 data/v2.db
-docs/equity_*.png

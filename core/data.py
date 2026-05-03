@@ -74,9 +74,12 @@ def fetch_from_bridge(symbol: str, tf: str, n_bars: int,
     req_dir.mkdir(parents=True, exist_ok=True)
     rep_dir.mkdir(parents=True, exist_ok=True)
 
+    # Method name + param keys must match v1's working bridge protocol exactly.
+    # See ~/Documents/mt5_quant_trader/src/mt5_client.py:329 — the EA only
+    # responds to "copy_rates" with {"name", "timeframe", "count"}.
     rid = uuid.uuid4().hex
-    req = {"id": rid, "method": "candles",
-           "params": {"symbol": symbol, "tf": tf, "n": int(n_bars)}}
+    req = {"id": rid, "method": "copy_rates",
+           "params": {"name": symbol, "timeframe": tf, "count": int(n_bars)}}
     req_path = req_dir / f"{rid}.json"
     rep_path = rep_dir / f"{rid}.json"
 
@@ -105,10 +108,31 @@ def fetch_from_bridge(symbol: str, tf: str, n_bars: int,
     else:
         raise TimeoutError(f"bridge did not respond within {timeout_s}s")
 
-    if "candles" not in resp:
-        raise RuntimeError(f"bridge response missing 'candles': {resp}")
+    # v1's bridge returns a list of bar-dicts directly (or wraps under a key).
+    # Accept either shape so we're robust to EA versions.
+    if isinstance(resp, list):
+        rows = resp
+    elif isinstance(resp, dict):
+        # Most likely: {"id": "...", "ok": true, "data": [...]}
+        # or a top-level list of bars under some key
+        rows = (resp.get("data") or resp.get("rates")
+                or resp.get("candles") or resp.get("bars"))
+        if rows is None:
+            # Some bridges return the bars at the top level WITH metadata
+            # alongside — strip out non-bar keys
+            non_bar_keys = {"id", "ok", "error", "method"}
+            possible = {k: v for k, v in resp.items() if k not in non_bar_keys}
+            # If exactly one remaining key is a list, use it
+            list_vals = [v for v in possible.values() if isinstance(v, list)]
+            if len(list_vals) == 1:
+                rows = list_vals[0]
+        if rows is None:
+            raise RuntimeError(
+                f"bridge response had no recognisable bars list: keys={list(resp.keys())}"
+            )
+    else:
+        raise RuntimeError(f"unexpected bridge response type: {type(resp)}")
 
-    rows = resp["candles"]
     if not rows:
         raise RuntimeError(f"bridge returned 0 candles for {symbol} {tf}")
 

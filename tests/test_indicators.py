@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.indicators import ema, true_range, atr_wilder
+from core.indicators import (
+    ema, true_range, atr_wilder, rolling_high, rolling_low,
+    rsi_wilder, bollinger_bands,
+)
 from tests.fixtures.synthetic import constant, linear_ramp, step_function
 
 
@@ -178,3 +181,93 @@ class TestIdempotency:
         a = atr_wilder(df, 14).values
         b = atr_wilder(df, 14).values
         assert np.array_equal(a, b)
+
+
+# ===========================================================================
+# Rolling high/low — closed-form properties
+# ===========================================================================
+class TestRollingHighLow:
+    def test_rolling_high_of_constant_is_constant(self):
+        df = constant(price=100, n_bars=50)
+        h = rolling_high(df["close"], 5)
+        # Bars 0..3: NaN (min_periods not met). Bar 4 onwards: 100.
+        assert h.iloc[0:4].isna().all()
+        assert (h.iloc[4:] == 100.0).all()
+
+    def test_rolling_high_of_linear_ramp_is_current_close(self):
+        """On a strictly increasing series, rolling max = current bar's close."""
+        step = 0.5
+        df = linear_ramp(start_price=100, step=step, n_bars=30)
+        h = rolling_high(df["close"], 10)
+        for i in range(9, len(df)):
+            assert abs(h.iloc[i] - df["close"].iloc[i]) < 1e-9
+
+    def test_rolling_low_of_linear_ramp_is_oldest_in_window(self):
+        """On a strictly increasing series, rolling min over window N
+        equals the close N-1 bars ago."""
+        step = 0.5
+        df = linear_ramp(start_price=100, step=step, n_bars=30)
+        period = 10
+        l = rolling_low(df["close"], period)
+        for i in range(period - 1, len(df)):
+            expected = df["close"].iloc[i - period + 1]
+            assert abs(l.iloc[i] - expected) < 1e-9
+
+
+# ===========================================================================
+# RSI Wilder — closed-form properties
+# ===========================================================================
+class TestRSI:
+    def test_rsi_constant_undefined_then_neutral(self):
+        """On constant prices, gains and losses both 0 → RSI is the
+        undefined case which we map to 50 (neutral)."""
+        df = constant(price=100, n_bars=50)
+        r = rsi_wilder(df["close"], 14)
+        # The first bar has NaN (no prior diff). Subsequent bars:
+        # gain=0, loss=0 → both averages 0 → we map to 50.
+        non_nan = r.dropna()
+        assert (non_nan == 50.0).all() or (non_nan.iloc[15:] == 50.0).all()
+
+    def test_rsi_strict_uptrend_above_50(self):
+        """On a strictly increasing series, RSI must be >> 50 (typically 100)."""
+        df = linear_ramp(start_price=100, step=0.5, n_bars=50)
+        r = rsi_wilder(df["close"], 14).dropna()
+        # All gains, no losses → RSI = 100
+        assert (r >= 99.0).all(), f"expected RSI≈100 on uptrend; got {r.head()}"
+
+    def test_rsi_strict_downtrend_below_50(self):
+        """On a strictly decreasing series, RSI must be near 0."""
+        df = linear_ramp(start_price=200, step=-0.5, n_bars=50)
+        r = rsi_wilder(df["close"], 14).dropna()
+        assert (r <= 1.0).all(), f"expected RSI≈0 on downtrend; got {r.head()}"
+
+
+# ===========================================================================
+# Bollinger Bands — closed-form properties
+# ===========================================================================
+class TestBollingerBands:
+    def test_bands_collapse_on_constant(self):
+        """Constant series → stdev = 0 → upper = mid = lower."""
+        df = constant(price=100, n_bars=50)
+        upper, mid, lower = bollinger_bands(df["close"], 20, k=2.0)
+        # After warmup
+        for i in range(20, len(df)):
+            assert abs(mid.iloc[i] - 100) < 1e-9
+            assert abs(upper.iloc[i] - 100) < 1e-9
+            assert abs(lower.iloc[i] - 100) < 1e-9
+
+    def test_bands_symmetric_around_mid(self):
+        """upper - mid == mid - lower, always."""
+        df = linear_ramp(start_price=100, step=0.5, n_bars=50)
+        upper, mid, lower = bollinger_bands(df["close"], 20, k=2.0)
+        diff = (upper - mid) - (mid - lower)
+        # Where bands are defined (post warmup), symmetry must hold
+        assert diff.dropna().abs().max() < 1e-9
+
+    def test_bands_widen_with_k(self):
+        """Larger k = wider bands."""
+        df = linear_ramp(start_price=100, step=1.0, n_bars=50)
+        u1, _, l1 = bollinger_bands(df["close"], 20, k=1.0)
+        u2, _, l2 = bollinger_bands(df["close"], 20, k=2.0)
+        # Compare on the last value (post-warmup)
+        assert (u2.iloc[-1] - l2.iloc[-1]) > (u1.iloc[-1] - l1.iloc[-1])

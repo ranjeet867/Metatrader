@@ -21,7 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from core.backtest import run_backtest
+from core.backtest import partition_train_test, run_backtest
 from core.data import load_parquet
 from core import storage
 from strategies.ema_cross import EmaCross, EmaCrossParams
@@ -35,6 +35,12 @@ def main() -> int:
     ap.add_argument("--lots", type=float, default=0.1)
     ap.add_argument("--money-per-unit", type=float, default=1.0,
                     help="$ per 1.0 price unit per 1 lot (US100.cash default = $1)")
+    ap.add_argument("--commission-per-trade", type=float, default=0.0,
+                    help="$ deducted from realized_pnl per closed trade (round-trip)")
+    ap.add_argument("--slippage-atr-frac", type=float, default=0.0,
+                    help="per-fill slippage as fraction of ATR(14) at the fill bar")
+    ap.add_argument("--train-pct", type=float, default=0.6,
+                    help="fraction of bars considered IN-SAMPLE for the train/test split")
     ap.add_argument("--fast", type=int, default=9)
     ap.add_argument("--slow", type=int, default=20)
     ap.add_argument("--stop-atr-mult", type=float, default=1.5)
@@ -71,6 +77,8 @@ def main() -> int:
         starting_balance=args.balance,
         lots=args.lots,
         money_per_unit_price=args.money_per_unit,
+        commission_per_trade=args.commission_per_trade,
+        slippage_per_fill_atr_frac=args.slippage_atr_frac,
     )
 
     # ---- Reconciliation gate (HARD FAIL if it doesn't reconcile) ----
@@ -115,6 +123,23 @@ def main() -> int:
         c = Counter(t.close_reason for t in result.trades)
         for reason, n in c.most_common():
             print(f"    {reason:14s} {n:>4d}")
+
+        # ---- OOS partition report ----
+        train, test = partition_train_test(result, args.train_pct, n_bars=len(df))
+        split_idx = int(len(df) * args.train_pct)
+        split_time = df["time"].iloc[split_idx] if split_idx < len(df) else df["time"].iloc[-1]
+        print(f"\n  ── OOS partition (train_pct={args.train_pct}, split @ bar {split_idx}, "
+              f"{split_time}) ──")
+        for m in (train, test):
+            tr_pf = "inf" if m.profit_factor == float("inf") else f"{m.profit_factor:.2f}"
+            print(f"    {m.label:<5s} n={m.n_trades:>4d}  PF={tr_pf:>5s}  "
+                  f"avg_R={m.avg_R:>+6.3f}  win%={m.win_rate:>5.1f}  "
+                  f"$={m.sum_pnl:>+10,.2f}")
+        # Sum invariant
+        diff = train.sum_pnl + test.sum_pnl - result.sum_realized_pnl
+        if abs(diff) > 1e-6:
+            print(f"  ⛔ partition sum invariant broken: train+test - total = {diff}")
+            return 4
 
     # ---- Persist to SQLite ----
     storage.init_schema(args.db)

@@ -23,10 +23,12 @@ class Signal:
     """A trade entry signal. Emitted by a strategy on a specific bar."""
     bar_idx: int                    # 0-based index into the candle DataFrame
     direction: Direction
-    entry_price: float              # the close of the signal bar (what we'll fill at)
+    entry_price: float              # price we expect to fill at (usually bar close)
     stop_price: float               # initial stop-loss
     target_price: float             # initial take-profit
     reason: str = ""                # human-readable for debugging
+    max_hold_bars: int = 0          # if >0, force-close at close of bar (entry_bar + max_hold_bars)
+                                     # 0 = no time-based exit, only SL/TP/EOD
 
 
 class Strategy(Protocol):

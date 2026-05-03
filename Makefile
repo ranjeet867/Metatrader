@@ -66,5 +66,33 @@ backtest-tf:
 	$(PYBIN) scripts/run_backtest.py --ticker US100.cash --tf $(or $(TF),H1) \
 	  --fast 12 --slow 26 --long-only
 
+# Run ALL 7 strategy variants on the given TF and print a comparison table.
+# Every result is reconciliation-checked — the gate halts if any strategy lies.
+# Usage: make sweep-strategies TF=H1
+#        make sweep-strategies TF=M15 LONGONLY=1
+sweep-strategies:
+	$(PYBIN) scripts/sweep_strategies.py --ticker US100.cash --tf $(or $(TF),H1) \
+	  $(if $(LONGONLY),--long-only,)
+
+# Same sweep but with REALISTIC FTMO friction modeled.
+# Default commission $3/round-trip, 0.1×ATR per-fill slippage, 60/40 train/test.
+# Usage: make sweep-realistic TF=H1 LONGONLY=1
+#        make sweep-realistic COMM=5 SLIP=0.15 TRAIN=0.7
+sweep-realistic:
+	$(PYBIN) scripts/sweep_strategies.py --ticker US100.cash --tf $(or $(TF),H1) \
+	  --commission-per-trade $(or $(COMM),3.0) \
+	  --slippage-atr-frac $(or $(SLIP),0.1) \
+	  --train-pct $(or $(TRAIN),0.6) \
+	  $(if $(LONGONLY),--long-only,)
+
+# Multi-ticker × multi-TF × multi-strategy grid sweep.
+# Outputs docs/grid_results.md heatmap.
+sweep-grid:
+	$(PYBIN) scripts/sweep_grid.py \
+	  --commission-per-trade $(or $(COMM),3.0) \
+	  --slippage-atr-frac $(or $(SLIP),0.1) \
+	  --train-pct $(or $(TRAIN),0.6) \
+	  $(if $(LONGONLY),--long-only,)
+
 clean:
 	rm -rf $(VENV) .pytest_cache .ruff_cache **/__pycache__

@@ -25,6 +25,7 @@ from strategies.ibs import Ibs, IbsParams
 from strategies.inside_bar import InsideBar, InsideBarParams
 from strategies.orb import Orb, OrbParams
 from strategies.overnight_drift import OvernightDrift, OvernightDriftParams
+from strategies.vol_breakout import VolBreakout, VolBreakoutParams
 from tests.fixtures.synthetic import constant, linear_ramp, sawtooth, step_function
 
 
@@ -37,6 +38,7 @@ ALL_STRATEGIES = [
     ("overnight_drift",    lambda: OvernightDrift(OvernightDriftParams())),
     ("orb",                lambda: Orb(OrbParams())),
     ("inside_bar",         lambda: InsideBar(InsideBarParams())),
+    ("vol_breakout",       lambda: VolBreakout(VolBreakoutParams())),
 ]
 
 
@@ -391,6 +393,88 @@ class TestInsideBarStrategy:
         s = next(s for s in sigs if s.bar_idx == 3 and s.direction == "LONG")
         risk = s.entry_price - s.stop_price
         assert abs((s.target_price - s.entry_price) - 2 * risk) < 1e-9
+
+
+# ===========================================================================
+# VolBreakout strategy — specific tests
+# ===========================================================================
+class TestVolBreakoutStrategy:
+    def test_long_fires_when_high_breaks_buy_trigger(self):
+        """bar 0 sets prior range = 2.0; bar 1 opens at 100, breaks UP through
+        100 + 0.5*2 = 101 → LONG at 101."""
+        n = 5
+        times = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+        df = pd.DataFrame({
+            "time": times,
+            "open":  [99.0, 100.0, 101.5, 102.0, 102.5],
+            "high":  [100.0, 102.0, 103.0, 102.5, 103.5],
+            "low":   [98.0,  99.5,  101.0, 101.5, 102.0],
+            "close": [99.5,  101.5, 102.5, 102.0, 103.0],
+            "volume": [1000.0] * n,
+        })
+        sigs = VolBreakout(VolBreakoutParams(k=0.5, target_R_mult=2.0)).signals(df)
+        # Range[0] = 100 - 98 = 2; bar 1 buy_trig = 100 + 0.5*2 = 101.
+        # Bar 1 high = 102 ≥ 101 ✓; low = 99.5 > sell_trig = 99 ✓
+        long_at_1 = [s for s in sigs if s.bar_idx == 1 and s.direction == "LONG"]
+        assert len(long_at_1) == 1
+        assert abs(long_at_1[0].entry_price - 101.0) < 1e-9
+        assert abs(long_at_1[0].stop_price - 99.0) < 1e-9
+        # 2R target: 101 + 2*(101-99) = 105
+        assert abs(long_at_1[0].target_price - 105.0) < 1e-9
+
+    def test_short_fires_when_low_breaks_sell_trigger(self):
+        n = 5
+        times = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+        df = pd.DataFrame({
+            "time": times,
+            "open":  [101.0, 100.0, 99.0, 98.0, 97.0],
+            "high":  [102.0, 100.5, 99.5, 98.5, 97.5],
+            "low":   [100.0, 98.5, 97.5, 96.5, 95.5],
+            "close": [101.5, 99.0, 98.0, 97.5, 96.5],
+            "volume": [1000.0] * n,
+        })
+        sigs = VolBreakout(VolBreakoutParams(k=0.5)).signals(df)
+        # Range[0] = 102-100 = 2; bar 1 sell_trig = 100 - 0.5*2 = 99.
+        # Bar 1 low = 98.5 ≤ 99 ✓; high = 100.5 < buy_trig = 101 ✓
+        short_at_1 = [s for s in sigs if s.bar_idx == 1 and s.direction == "SHORT"]
+        assert len(short_at_1) == 1
+        assert abs(short_at_1[0].entry_price - 99.0) < 1e-9
+
+    def test_skips_ambiguous_double_break(self):
+        """If a single bar hits BOTH triggers, skip (order is unknown)."""
+        n = 3
+        times = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+        df = pd.DataFrame({
+            "time": times,
+            "open":  [99.0, 100.0, 100.0],
+            "high":  [100.0, 102.0, 100.0],   # bar 1 high → break buy
+            "low":   [98.0,  98.0,  100.0],    # bar 1 low → break sell
+            "close": [99.5,  100.0, 100.0],
+            "volume": [1000.0] * n,
+        })
+        sigs = VolBreakout(VolBreakoutParams(k=0.5)).signals(df)
+        # Bar 1 hits both → skip
+        assert not any(s.bar_idx == 1 for s in sigs)
+
+    def test_long_only_skips_short_breaks(self):
+        n = 5
+        times = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+        df = pd.DataFrame({
+            "time": times,
+            "open":  [101.0, 100.0, 99.0, 98.0, 97.0],
+            "high":  [102.0, 100.5, 99.5, 98.5, 97.5],
+            "low":   [100.0, 98.5, 97.5, 96.5, 95.5],
+            "close": [101.5, 99.0, 98.0, 97.5, 96.5],
+            "volume": [1000.0] * n,
+        })
+        sigs = VolBreakout(VolBreakoutParams(long_only=True)).signals(df)
+        assert all(s.direction == "LONG" for s in sigs)
+
+    def test_skips_zero_range_prior(self):
+        """If prior bar has zero range, the breakout triggers degenerate."""
+        df = constant(price=100, n_bars=20)
+        sigs = VolBreakout(VolBreakoutParams()).signals(df)
+        assert sigs == []
 
 
 # ===========================================================================

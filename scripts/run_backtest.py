@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-run_backtest.py — end-to-end EMA cross backtest on a locked parquet.
+run_backtest.py — end-to-end backtest on a locked parquet, ANY strategy.
 
-Reads data/<ticker>_<tf>.parquet, runs EMA cross strategy + reconciliation-
-enforced backtester, prints a clean report, asserts reconciliation passes.
+Reads data/<ticker>_<tf>.parquet, builds the requested strategy, runs the
+reconciliation-enforced backtester, prints a clean report, asserts
+reconciliation passes.
 
 Usage:
   python scripts/run_backtest.py
-  python scripts/run_backtest.py --ticker US100.cash --tf H1 --balance 91400 --lots 0.5
+  python scripts/run_backtest.py --ticker US100.cash --tf D1 --strategy vol_breakout --long-only
+  python scripts/run_backtest.py --strategy ema_cross --fast 12 --slow 26
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import uuid
@@ -24,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 from core.backtest import partition_train_test, run_backtest
 from core.data import load_parquet
 from core import storage
+from dashboards.control import discover_strategies
 from strategies.ema_cross import EmaCross, EmaCrossParams
 
 
@@ -31,6 +35,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticker", default="US100.cash")
     ap.add_argument("--tf", default="H1")
+    ap.add_argument("--strategy", default="ema_cross",
+                    help="strategy name (auto-discovered from strategies/)")
+    ap.add_argument("--params-json", default=None,
+                    help="JSON dict of param overrides for the strategy (optional)")
     ap.add_argument("--balance", type=float, default=91_400)
     ap.add_argument("--lots", type=float, default=0.1)
     ap.add_argument("--money-per-unit", type=float, default=1.0,
@@ -41,6 +49,7 @@ def main() -> int:
                     help="per-fill slippage as fraction of ATR(14) at the fill bar")
     ap.add_argument("--train-pct", type=float, default=0.6,
                     help="fraction of bars considered IN-SAMPLE for the train/test split")
+    # ema_cross-specific shortcut flags (only used if --strategy ema_cross)
     ap.add_argument("--fast", type=int, default=9)
     ap.add_argument("--slow", type=int, default=20)
     ap.add_argument("--stop-atr-mult", type=float, default=1.5)
@@ -59,14 +68,44 @@ def main() -> int:
     print(f"  {len(df)} bars   "
           f"first={df['time'].iloc[0]}   last={df['time'].iloc[-1]}")
 
-    params = EmaCrossParams(
-        fast_period=args.fast, slow_period=args.slow,
-        atr_period=14,
-        stop_atr_mult=args.stop_atr_mult,
-        target_atr_mult=args.target_atr_mult,
-        long_only=args.long_only,
-    )
-    strategy = EmaCross(params)
+    # ---- Build the requested strategy ----
+    if args.strategy == "ema_cross":
+        params = EmaCrossParams(
+            fast_period=args.fast, slow_period=args.slow,
+            atr_period=14,
+            stop_atr_mult=args.stop_atr_mult,
+            target_atr_mult=args.target_atr_mult,
+            long_only=args.long_only,
+        )
+        strategy = EmaCross(params)
+    else:
+        strats = discover_strategies()
+        if args.strategy not in strats:
+            print(f"ERROR: unknown strategy '{args.strategy}'. "
+                  f"Available: {sorted(strats.keys())}")
+            return 5
+        StratCls, ParamsCls = strats[args.strategy]
+        kwargs: dict = {}
+        if ParamsCls is not None:
+            field_names = {f.name for f in dataclasses.fields(ParamsCls)}
+            if "long_only" in field_names and args.long_only:
+                kwargs["long_only"] = True
+            if args.params_json:
+                try:
+                    overrides = json.loads(args.params_json)
+                except json.JSONDecodeError as e:
+                    print(f"ERROR: --params-json is not valid JSON: {e}")
+                    return 5
+                bad = set(overrides) - field_names
+                if bad:
+                    print(f"ERROR: unknown params for {args.strategy}: {bad}")
+                    return 5
+                kwargs.update(overrides)
+            params = ParamsCls(**kwargs)
+            strategy = StratCls(params)
+        else:
+            params = None
+            strategy = StratCls()
     signals = strategy.signals(df)
     print(f"\nStrategy: {strategy.name}  params={params}")
     print(f"  Signals generated: {len(signals)}")
@@ -148,7 +187,9 @@ def main() -> int:
         args.db, run_id,
         started_at_utc=datetime.now(timezone.utc).isoformat(),
         symbol=args.ticker, tf=args.tf, strategy_name=strategy.name,
-        config_json=json.dumps(params.__dict__),
+        config_json=json.dumps(
+            dataclasses.asdict(params) if params is not None else {}
+        ),
         starting_balance=args.balance,
     )
     trade_rows = [{

@@ -63,13 +63,17 @@ def replay_run(
     symbol: str,
     tf: str,
     starting_balance: float,
-    lots: float,
+    lots: float = 0.0,
     money_per_unit_price: float,
     commission_per_trade: float = 0.0,
     slippage_per_fill_atr_frac: float = 0.0,
     slippage_atr_period: int = 14,
     time_guard_cfg: TimeGuardCfg | None = None,
     reconcile_tolerance: float = 0.01,
+    # ----- Phase 27: dynamic sizing for replay parity with sized backtests
+    risk_pct: float | None = None,
+    symbol_info=None,
+    sizing_uses_running_balance: bool = True,
 ) -> ReplayResult:
     n = len(candles)
     if n == 0:
@@ -156,23 +160,46 @@ def replay_run(
 
         # Step 2: open new position from a precomputed signal at bar i.
         # Backtest behaviour: silently ignore signals while a position is open.
-        if not executor.has_position(symbol) and i in sigs_by_bar:
-            # No-entry-window check (matches run_backtest behaviour)
-            if (time_guard_cfg is not None
-                and time_guard_cfg.no_entry_minutes_before_close > 0
-                and bar_close is not None
-                and in_no_entry_window(bar_close, time_guard_cfg)):
+        sizing_active = (risk_pct is not None and risk_pct > 0
+                          and symbol_info is not None)
+        should_open = (not executor.has_position(symbol)
+                         and i in sigs_by_bar)
+        if should_open:
+            in_no_entry = (time_guard_cfg is not None
+                              and time_guard_cfg.no_entry_minutes_before_close > 0
+                              and bar_close is not None
+                              and in_no_entry_window(bar_close, time_guard_cfg))
+            if in_no_entry:
                 skipped_signals += 1
+                should_open = False
+        if should_open:
+            sig = sigs_by_bar[i]
+            # Dynamic sizing match-with-backtest path
+            if sizing_active:
+                from core.position_sizer import calc_lots
+                sizing_balance = balance if sizing_uses_running_balance else starting_balance
+                res = calc_lots(
+                    equity=sizing_balance, risk_pct=float(risk_pct),
+                    entry_price=sig.entry_price, stop_price=sig.stop_price,
+                    sym=symbol_info,
+                )
+                if not res.ok:
+                    skipped_signals += 1
+                    should_open = False
+                else:
+                    trade_lots = res.lots
             else:
-                sig = sigs_by_bar[i]
-                key = f"{strategy.name}:{symbol}:{tf}:{i}:{sig.bar_idx}"
-                executor.open(
-                    symbol=symbol, direction=sig.direction,
-                    signal_entry_price=sig.entry_price,
-                    stop_price=sig.stop_price,
-                    target_price=sig.target_price,
-                    lots=lots,
-                    money_per_unit_price=money_per_unit_price,
+                trade_lots = float(lots)
+        if should_open:
+            sig = sigs_by_bar[i]
+            key = f"{strategy.name}:{symbol}:{tf}:{i}:{sig.bar_idx}"
+            executor.open(
+                symbol=symbol, direction=sig.direction,
+                signal_entry_price=sig.entry_price,
+                stop_price=sig.stop_price,
+                target_price=sig.target_price,
+                lots=trade_lots,
+                money_per_unit_price=money_per_unit_price,
                     idempotency_key=key,
                     opened_at_bar_idx=i,
                     opened_at_utc=pd.Timestamp(times_pd.iloc[i]).isoformat(),

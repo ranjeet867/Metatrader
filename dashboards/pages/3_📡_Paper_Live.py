@@ -24,6 +24,7 @@ from core.config import load_config, save_config   # noqa: E402
 from core.data import load_parquet   # noqa: E402
 from core.parity_gate import ParityGate   # noqa: E402
 from core.replay import replay_run   # noqa: E402
+from core.symbol_info_loader import try_load as try_load_symbol_info   # noqa: E402
 from core.time_guards import time_guard_cfg_from_risk_config   # noqa: E402
 from dashboards.components import reconciliation_badge   # noqa: E402
 from dashboards.components.charts import equity_figure   # noqa: E402
@@ -55,13 +56,18 @@ def _paper_runs() -> dict:
 
 def render_replay_tab(strategies, data_index, cfg):
     st.subheader("🎬  Replay — proves the engine reproduces backtest")
-    cols = st.columns([1, 1, 1, 1])
+    cols = st.columns([1, 1, 1, 1, 1])
     ticker = cols[0].selectbox("ticker", sorted(data_index.keys()),
                                   key="rp_ticker")
     tf = cols[1].selectbox("tf", sorted(data_index[ticker].keys()), key="rp_tf")
     sname = cols[2].selectbox("strategy", sorted(strategies.keys()),
                                  key="rp_s")
-    enforce_flats = cols[3].checkbox("Enforce time guards", value=True,
+    risk_pct_val = float(cols[3].number_input("risk per trade %",
+                                                  value=0.3, step=0.1,
+                                                  format="%.2f",
+                                                  min_value=0.05, max_value=5.0,
+                                                  key="rp_risk"))
+    enforce_flats = cols[4].checkbox("Enforce time guards", value=True,
                                         key="rp_flats")
     StratCls, ParamsCls = strategies[sname]
     params_obj = (render_params_form(ParamsCls, key_prefix="rp_p")
@@ -76,6 +82,14 @@ def render_replay_tab(strategies, data_index, cfg):
         st.error(f"setup: {e}")
         return
 
+    sym_info = try_load_symbol_info(ticker)
+    use_dynamic = sym_info is not None
+    if not use_dynamic:
+        st.warning(
+            f"No symbol_info for `{ticker}` — replay will use fixed lots from "
+            "DEFAULT_LOTS table. Run `make refresh-symbol-info`."
+        )
+
     # Both backtest AND replay — so we can show parity numerically
     bt = run_backtest(
         df, strat.signals(df), starting_balance=91_400,
@@ -85,6 +99,8 @@ def render_replay_tab(strategies, data_index, cfg):
         symbol=ticker,
         enforce_weekend_flat=enforce_flats and cfg.weekend_flat_all,
         enforce_daily_flat=enforce_flats,
+        risk_pct=risk_pct_val if use_dynamic else None,
+        symbol_info=sym_info,
     )
     tg_cfg = time_guard_cfg_from_risk_config(cfg) if enforce_flats else None
     rp = replay_run(
@@ -95,6 +111,8 @@ def render_replay_tab(strategies, data_index, cfg):
         money_per_unit_price=DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0),
         commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
         time_guard_cfg=tg_cfg,
+        risk_pct=risk_pct_val if use_dynamic else None,
+        symbol_info=sym_info,
     )
 
     # Reconciliation badges for BOTH
@@ -129,6 +147,14 @@ def render_replay_tab(strategies, data_index, cfg):
     cols[2].metric("backtest $", f"${bt.sum_realized_pnl:+,.2f}")
     cols[3].metric("replay $", f"${rp.sum_realized_pnl:+,.2f}",
                     delta=f"${div:.4f} div")
+
+    if use_dynamic and rp.n_trades > 0:
+        avg_lots = sum(t.lots for t in rp.trades) / rp.n_trades
+        avg_risk_d = sum(t.initial_dollar_risk for t in rp.trades) / rp.n_trades
+        st.caption(
+            f"📐 Sized at {risk_pct_val:.2f}% per trade → "
+            f"avg lots = {avg_lots:.2f}, avg $ at risk = ${avg_risk_d:,.0f}"
+        )
 
     st.plotly_chart(equity_figure(rp.equity_curve, None, 91_400,
                                     f"Replay equity — {ticker} {tf} {sname}"),

@@ -24,6 +24,7 @@ if str(REPO) not in sys.path:
 from core.backtest import partition_train_test, run_backtest   # noqa: E402
 from core.config import load_config   # noqa: E402
 from core.data import load_parquet   # noqa: E402
+from core.symbol_info_loader import try_load as try_load_symbol_info   # noqa: E402
 from dashboards.components import reconciliation_badge   # noqa: E402
 from dashboards.components.charts import (   # noqa: E402
     drawdown_figure,
@@ -46,7 +47,7 @@ from dashboards.components.state import (   # noqa: E402
 
 def _run_one(df, strat, *, balance, lots, mpu, comm, slip, train_pct,
               symbol, enforce_weekend_flat, enforce_daily_flat,
-              no_entry_min):
+              no_entry_min, risk_pct=None, symbol_info=None):
     sigs = strat.signals(df)
     result = run_backtest(
         df, sigs,
@@ -57,6 +58,7 @@ def _run_one(df, strat, *, balance, lots, mpu, comm, slip, train_pct,
         enforce_weekend_flat=enforce_weekend_flat,
         enforce_daily_flat=enforce_daily_flat,
         no_entry_minutes_before_close=no_entry_min,
+        risk_pct=risk_pct, symbol_info=symbol_info,
     )
     train, test = partition_train_test(result, train_pct, n_bars=len(df))
     return {"result": result, "signals": sigs,
@@ -95,8 +97,35 @@ def render_backtest_section(strategies, data_index, cfg):
         st.markdown("**Friction & sizing**")
         balance = float(st.number_input("starting balance ($)", value=91_400.0,
                                           step=1000.0, key="bt_bal"))
-        lots = float(st.number_input("lots", value=DEFAULT_LOTS.get(ticker, 0.1),
-                                       step=0.1, format="%.2f", key="bt_lots"))
+
+        # Sizing mode toggle: dynamic risk_pct (default) vs fixed lots
+        sizing_mode = st.radio(
+            "sizing mode",
+            ["risk %", "fixed lots"],
+            index=0, horizontal=True, key="bt_sizing_mode",
+            help="risk %: lots computed per-trade from equity × risk%. "
+                  "fixed lots: legacy mode (every trade same size).",
+        )
+        if sizing_mode == "risk %":
+            risk_pct_val = float(st.number_input(
+                "risk per trade (%)",
+                value=0.3, step=0.1, format="%.2f", min_value=0.05, max_value=5.0,
+                key="bt_risk_pct",
+            ))
+            lots = 0.0   # unused
+            sym_info = try_load_symbol_info(ticker)
+            if sym_info is None:
+                st.warning(f"No symbol_info entry for `{ticker}` — falling back "
+                            "to fixed lots. Run `make refresh-symbol-info`.")
+                sizing_mode = "fixed lots"
+                risk_pct_val = None
+                sym_info = None
+        else:
+            risk_pct_val = None
+            sym_info = None
+            lots = float(st.number_input("lots", value=DEFAULT_LOTS.get(ticker, 0.1),
+                                            step=0.1, format="%.2f", key="bt_lots"))
+
         mpu = float(st.number_input("money per 1.0 unit per lot ($)",
                                       value=DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0),
                                       step=1.0, format="%.2f", key="bt_mpu"))
@@ -150,6 +179,7 @@ def render_backtest_section(strategies, data_index, cfg):
                 enforce_weekend_flat=enforce_weekend,
                 enforce_daily_flat=enforce_daily,
                 no_entry_min=no_entry,
+                risk_pct=risk_pct_val, symbol_info=sym_info,
             )
         except Exception as e:
             st.error(f"Backtest failed: {e}")
@@ -165,6 +195,7 @@ def render_backtest_section(strategies, data_index, cfg):
             "no_entry_minutes": no_entry,
             "params_obj": params_obj,
             "tolerance": run["result"].reconcile_tolerance,
+            "sizing_mode": sizing_mode, "risk_pct": risk_pct_val,
         }
 
     run = st.session_state[KEY_LAST_BACKTEST]
@@ -198,6 +229,23 @@ def render_backtest_section(strategies, data_index, cfg):
                     delta=f"${r.equity_curve_pnl:+,.0f}")
     cols[5].metric("skipped", f"{r.skipped_signals}",
                     help="signals dropped because in_no_entry_window")
+
+    # Sizing summary
+    if meta.get("sizing_mode") == "risk %":
+        if n > 0:
+            avg_lots = sum(t.lots for t in r.trades) / n
+            avg_risk_dollars = sum(t.initial_dollar_risk for t in r.trades) / n
+            avg_risk_pct = avg_risk_dollars / meta["balance"] * 100 if meta["balance"] else 0
+            st.caption(
+                f"📐 **Dynamic sizing** target {meta['risk_pct']:.2f}% per trade "
+                f"→ avg lots = {avg_lots:.2f}, "
+                f"avg $ at risk = ${avg_risk_dollars:,.0f} "
+                f"({avg_risk_pct:.2f}% of starting balance)."
+            )
+        else:
+            st.caption(f"📐 Dynamic sizing target {meta['risk_pct']:.2f}% per trade.")
+    else:
+        st.caption(f"📐 Fixed sizing: {meta.get('lots', 0)} lots per trade.")
 
     # Train/Test
     train, test = run["train"], run["test"]

@@ -82,7 +82,11 @@ def trade_reasons_figure(trades) -> go.Figure:
 
 
 def trades_to_dataframe(trades, candles: pd.DataFrame) -> pd.DataFrame:
-    """Turn ClosedTrade list into a sortable DataFrame for st.dataframe."""
+    """Turn ClosedTrade list into a sortable DataFrame for st.dataframe.
+
+    Includes `lots` and `$_at_risk` (= initial_dollar_risk) so the user
+    can verify the dynamic-sizing path produced the intended risk per trade.
+    """
     rows = []
     for t in trades:
         rows.append({
@@ -93,7 +97,8 @@ def trades_to_dataframe(trades, candles: pd.DataFrame) -> pd.DataFrame:
             "exit":        round(t.exit_price, 5),
             "stop":        round(t.stop_price, 5),
             "target":      round(t.target_price, 5),
-            "lots":        t.lots,
+            "lots":        round(t.lots, 4),
+            "$_at_risk":   round(t.initial_dollar_risk, 2),
             "pnl_$":       round(t.realized_pnl, 2),
             "R":           round(t.r_multiple, 3),
             "reason":      t.close_reason,

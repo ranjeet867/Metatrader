@@ -128,6 +128,71 @@ def render_emergency_stop_section():
             st.rerun()
 
 
+def render_position_sizing_section():
+    """Phase 30: risk-per-trade slider + projected-lots preview per ticker."""
+    from core.position_sizer import calc_lots
+    from core.symbol_info_loader import load_all as load_all_symbols
+
+    st.markdown("### 📐  Position sizing")
+    st.caption(
+        "All paper / live opens compute lots dynamically as "
+        "`equity × risk_pct% / (stop_distance × $-per-tick)`. "
+        "The same formula runs in backtest when `risk_pct` is supplied. "
+        "Wire-up location: `core.position_sizer.calc_lots`."
+    )
+
+    cols = st.columns(3)
+    risk_pct = float(cols[0].select_slider(
+        "risk per trade (%)",
+        options=[0.10, 0.20, 0.30, 0.50, 0.70, 1.00],
+        value=0.30, key="ar_risk_slider",
+    ))
+    equity = float(cols[1].number_input("account equity ($)",
+                                            value=91_400.0, step=1000.0,
+                                            key="ar_equity"))
+    typical_stop_R = float(cols[2].number_input(
+        "stop distance (in 'R' i.e. fraction of price)",
+        value=0.0050, format="%.4f", step=0.0010, key="ar_stop_R",
+        help="Used only for the projection table — actual trades use the "
+              "live signal's stop. 0.005 = 0.5%% from entry.",
+    ))
+
+    # Build projected-lots table
+    try:
+        all_syms = load_all_symbols()
+    except Exception as e:
+        st.warning(f"Could not load symbol_info.json: {e}")
+        return
+
+    # A reasonable typical entry per ticker — used only to compute a stop_distance
+    # for the preview. Users see the FORMULA, not a real trade.
+    TYPICAL_ENTRY = {
+        "US100.cash": 21000.0, "US500.cash": 5500.0,
+        "GER40.cash": 18000.0, "EU50.cash": 4900.0,
+        "EURUSD": 1.10, "GBPUSD": 1.27, "USDJPY": 150.0,
+        "GBPJPY": 191.0, "AUDUSD": 0.66, "NZDUSD": 0.60,
+        "XAUUSD": 2000.0, "XAGUSD": 25.0,
+    }
+    rows = []
+    for sym, info in sorted(all_syms.items()):
+        entry = TYPICAL_ENTRY.get(sym, 100.0)
+        stop_dist = entry * typical_stop_R
+        stop = entry - stop_dist
+        res = calc_lots(equity=equity, risk_pct=risk_pct,
+                          entry_price=entry, stop_price=stop, sym=info)
+        rows.append({
+            "symbol": sym,
+            "typical_entry": entry,
+            "stop_distance": round(stop_dist, info.digits),
+            "lots": round(res.lots, 4) if res.ok else "—",
+            "$ at risk": round(res.money_risk, 2) if res.ok else "—",
+            "result": "ok" if res.ok else res.reason,
+        })
+    st.markdown(f"**Projected lots at {risk_pct:.2f}% on ${equity:,.0f} equity**")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                  height=min(420, 36 * (len(rows) + 1)))
+
+
 def render_risk_caps_editor(cfg):
     st.markdown("### ⚙️  Risk caps (data/risk_config.json)")
     st.caption(
@@ -267,6 +332,7 @@ def main():
     cfg = load_config()
     render_account_section()
     render_ftmo_progress(cfg)
+    render_position_sizing_section()
     render_per_strategy_risk()
     render_time_guards(cfg)
     render_emergency_stop_section()

@@ -21,6 +21,7 @@ from strategies.ema_pullback import EmaPullback, EmaPullbackParams
 from strategies.donchian_breakout import DonchianBreakout, DonchianBreakoutParams
 from strategies.rsi_meanrev import RsiMeanRev, RsiMeanRevParams
 from strategies.bbands_meanrev import BBandsMeanRev, BBandsMeanRevParams
+from strategies.first30_meanrev import First30MeanRev, First30MeanRevParams
 from strategies.ibs import Ibs, IbsParams
 from strategies.inside_bar import InsideBar, InsideBarParams
 from strategies.orb import Orb, OrbParams
@@ -39,6 +40,7 @@ ALL_STRATEGIES = [
     ("orb",                lambda: Orb(OrbParams())),
     ("inside_bar",         lambda: InsideBar(InsideBarParams())),
     ("vol_breakout",       lambda: VolBreakout(VolBreakoutParams())),
+    ("first30_meanrev",    lambda: First30MeanRev(First30MeanRevParams())),
 ]
 
 
@@ -475,6 +477,110 @@ class TestVolBreakoutStrategy:
         df = constant(price=100, n_bars=20)
         sigs = VolBreakout(VolBreakoutParams()).signals(df)
         assert sigs == []
+
+
+# ===========================================================================
+# First30MeanRev strategy — specific tests
+# ===========================================================================
+def _m15_first30_session(direction: str = "up_spike",
+                          n_sessions: int = 1) -> pd.DataFrame:
+    """Build M15 candles spanning session(s) where bar A (13:30) has a clear
+    up-spike or down-spike beyond strength_atr_mult × ATR.
+
+    Pre-session warm-up bars supply ATR data; ATR ≈ 1.0 in this fixture.
+    """
+    rows = []
+    # 30 warm-up M15 bars at constant 100 ± 0.5 to give ATR = 1.0 quickly
+    base_time = pd.Timestamp("2024-01-02 08:00:00", tz="UTC")
+    for k in range(40):
+        t = base_time + pd.Timedelta(minutes=15 * k)
+        # alternate +1/-1 close to keep ATR around 1.0
+        c = 100.0 + (0.5 if k % 2 == 0 else -0.5)
+        rows.append({
+            "time": t, "open": 100.0, "high": c + 0.5, "low": c - 0.5,
+            "close": c, "volume": 1000.0,
+        })
+
+    # Now sessions
+    for d in range(n_sessions):
+        session_date = pd.Timestamp("2024-01-03", tz="UTC") + pd.Timedelta(days=d)
+        # bar A: 13:30 with a strong move
+        bar_a_time = session_date + pd.Timedelta(hours=13, minutes=30)
+        if direction == "up_spike":
+            a_open, a_close = 100.0, 102.0   # +2 ATR move
+        else:
+            a_open, a_close = 100.0, 98.0    # -2 ATR move
+        rows.append({
+            "time": bar_a_time, "open": a_open,
+            "high": max(a_open, a_close) + 0.2,
+            "low":  min(a_open, a_close) - 0.2,
+            "close": a_close, "volume": 1000.0,
+        })
+        # bar B: 13:45
+        bar_b_time = bar_a_time + pd.Timedelta(minutes=15)
+        # bar B close near bar A close (still in spike direction)
+        b_close = a_close + (0.1 if direction == "up_spike" else -0.1)
+        rows.append({
+            "time": bar_b_time, "open": a_close,
+            "high": b_close + 0.3, "low": b_close - 0.3,
+            "close": b_close, "volume": 1000.0,
+        })
+        # 14:00 .. 15:00 bars (5 bars total post-B); price drifts toward open
+        for k in range(5):
+            t = bar_b_time + pd.Timedelta(minutes=15 * (k + 1))
+            # drift toward bar A's open
+            f = (k + 1) / 6.0
+            cprice = b_close * (1 - f) + a_open * f
+            rows.append({
+                "time": t, "open": cprice,
+                "high": cprice + 0.3, "low": cprice - 0.3,
+                "close": cprice, "volume": 1000.0,
+            })
+        # buffer bars to next session start
+        for k in range(85):
+            t = bar_b_time + pd.Timedelta(minutes=15 * (k + 7))
+            rows.append({
+                "time": t, "open": a_open,
+                "high": a_open + 0.5, "low": a_open - 0.5,
+                "close": a_open, "volume": 1000.0,
+            })
+    return pd.DataFrame(rows)
+
+
+class TestFirst30MeanRev:
+    def test_no_signals_on_hourly_data(self):
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=10, down_bars=10, n_cycles=5)
+        sigs = First30MeanRev(First30MeanRevParams()).signals(df)
+        assert sigs == []
+
+    def test_short_fires_after_up_spike(self):
+        df = _m15_first30_session(direction="up_spike", n_sessions=1)
+        sigs = First30MeanRev(First30MeanRevParams()).signals(df)
+        assert len(sigs) >= 1
+        s = sigs[0]
+        assert s.direction == "SHORT"
+        # target = bar A's open (= 100.0)
+        assert abs(s.target_price - 100.0) < 1e-9
+
+    def test_long_fires_after_down_spike(self):
+        df = _m15_first30_session(direction="down_spike", n_sessions=1)
+        sigs = First30MeanRev(First30MeanRevParams()).signals(df)
+        assert len(sigs) >= 1
+        s = sigs[0]
+        assert s.direction == "LONG"
+        assert abs(s.target_price - 100.0) < 1e-9
+
+    def test_long_only_skips_up_spike_shorts(self):
+        df = _m15_first30_session(direction="up_spike", n_sessions=2)
+        sigs = First30MeanRev(First30MeanRevParams(long_only=True)).signals(df)
+        assert all(s.direction == "LONG" for s in sigs)
+
+    def test_max_hold_5_bars(self):
+        df = _m15_first30_session(direction="down_spike", n_sessions=1)
+        sigs = First30MeanRev(First30MeanRevParams(max_hold_bars=5)).signals(df)
+        for s in sigs:
+            assert s.max_hold_bars == 5
 
 
 # ===========================================================================

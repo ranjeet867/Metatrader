@@ -42,6 +42,16 @@ lint:
 load-data:
 	$(PYBIN) scripts/load_real_data.py --ticker US100.cash --tf H1 --bars 8000
 
+# Refresh ALL cached parquets from the MT5 bridge in one shot.
+# Skips silently for any symbol the bridge doesn't currently serve.
+# Usage: make refresh-data
+#        make refresh-data BARS_D1=3000          # request more history per cell
+refresh-data:
+	$(PYBIN) scripts/refresh_all_data.py \
+	  --bars-d1 $(or $(BARS_D1),2000) \
+	  --bars-h1 $(or $(BARS_H1),8000) \
+	  --bars-m15 $(or $(BARS_M15),8000)
+
 # Shortcut: import a parquet from v1's daily cache. Fast path if you already
 # fetched data in v1 and just want to start backtesting in v2.
 import-from-v1:

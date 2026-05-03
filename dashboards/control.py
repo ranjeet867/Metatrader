@@ -130,6 +130,89 @@ DEFAULT_LOTS: dict[str, float] = {
 
 
 # ---------------------------------------------------------------------------
+# Data freshness
+# ---------------------------------------------------------------------------
+
+def freshness_summary(data_index: dict[str, dict[str, Path]]
+                       ) -> tuple[list[dict], int, int, int]:
+    """Compute per-file age in days and bucket counts.
+
+    Returns (rows, n_green, n_yellow, n_red).
+      rows: list of dicts with ticker, tf, modified_utc, age_days, bucket
+      bucket ∈ {"green", "yellow", "red"}: <2 days, 2-7 days, >7 days
+    """
+    now = datetime.now(timezone.utc)
+    rows: list[dict] = []
+    for ticker, tfs in sorted(data_index.items()):
+        for tf, path in sorted(tfs.items()):
+            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            age_days = (now - mtime).total_seconds() / 86400.0
+            if age_days < 2:
+                bucket = "green"
+            elif age_days < 7:
+                bucket = "yellow"
+            else:
+                bucket = "red"
+            rows.append({
+                "ticker": ticker, "tf": tf,
+                "modified_utc": mtime.isoformat(timespec="seconds"),
+                "age_days": round(age_days, 2), "bucket": bucket,
+            })
+    n_green = sum(1 for r in rows if r["bucket"] == "green")
+    n_yellow = sum(1 for r in rows if r["bucket"] == "yellow")
+    n_red = sum(1 for r in rows if r["bucket"] == "red")
+    return rows, n_green, n_yellow, n_red
+
+
+def render_freshness_bar(data_index: dict[str, dict[str, Path]]) -> None:
+    """Top-of-page status bar showing how stale each cached parquet is.
+
+    Always rendered; cheap to compute. Click the expander for the per-file table.
+    """
+    if not data_index:
+        st.warning("No cached parquets — use the Data Refresh tab to fetch some.")
+        return
+    rows, ng, ny, nr = freshness_summary(data_index)
+
+    # Compact summary row
+    cols = st.columns([1, 1, 1, 2])
+    cols[0].markdown(
+        f"<span style='background:#1c8a4a;color:white;padding:4px 10px;border-radius:4px;'>"
+        f"🟢  fresh &lt;2d: <b>{ng}</b></span>",
+        unsafe_allow_html=True,
+    )
+    cols[1].markdown(
+        f"<span style='background:#b08800;color:white;padding:4px 10px;border-radius:4px;'>"
+        f"🟡  2–7d: <b>{ny}</b></span>",
+        unsafe_allow_html=True,
+    )
+    cols[2].markdown(
+        f"<span style='background:#aa1a1a;color:white;padding:4px 10px;border-radius:4px;'>"
+        f"🔴  stale &gt;7d: <b>{nr}</b></span>",
+        unsafe_allow_html=True,
+    )
+    if nr > 0:
+        cols[3].markdown(
+            "🔴 **Some data is older than a week.** Run "
+            "`make refresh-data` (or use the Data Refresh tab) before "
+            "trusting backtest results."
+        )
+    elif ny > 0:
+        cols[3].markdown("🟡 Some data is 2-7 days old; refresh recommended for daily revalidation.")
+    else:
+        cols[3].markdown("🟢 All cached data is current (<2 days).")
+
+    with st.expander("Per-file ages", expanded=False):
+        df = pd.DataFrame(rows)
+        # Add a coloured emoji marker column for readability
+        emoji_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+        df["age"] = df["bucket"].map(emoji_map) + " " + df["age_days"].astype(str) + "d"
+        st.dataframe(df[["ticker", "tf", "modified_utc", "age"]],
+                      use_container_width=True,
+                      height=min(360, 36 * (len(rows) + 1)))
+
+
+# ---------------------------------------------------------------------------
 # Auto-form for a Params dataclass
 # ---------------------------------------------------------------------------
 
@@ -798,6 +881,10 @@ def main() -> None:
 
     strategies = discover_strategies()
     data_index = discover_data()
+
+    # Data-freshness status bar — always rendered at the top of the page.
+    render_freshness_bar(data_index)
+    st.markdown("---")
 
     tab_bt, tab_data, tab_sweep, tab_paper = st.tabs(
         ["🔬  Backtest", "🔄  Data Refresh", "🧮  Sweep", "📝  Paper (stub)"]

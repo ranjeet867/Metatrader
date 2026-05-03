@@ -135,3 +135,30 @@ def test_default_money_per_unit_covers_known_tickers():
     for t in ["US100.cash", "EU50.cash", "USDJPY", "EURUSD", "GBPJPY"]:
         assert t in ctrl.DEFAULT_MONEY_PER_UNIT
         assert t in ctrl.DEFAULT_LOTS
+
+
+def test_freshness_summary_buckets_files_correctly(tmp_path):
+    """freshness_summary should bucket files into <2d / 2-7d / >7d by mtime."""
+    import os
+    import time as time_mod
+    # Build a tiny fake data_index pointing at three temp files with controlled mtimes
+    fresh = tmp_path / "FRESH_D1.parquet"
+    medium = tmp_path / "MEDIUM_D1.parquet"
+    old = tmp_path / "OLD_D1.parquet"
+    for f in (fresh, medium, old):
+        f.write_bytes(b"x")
+    now = time_mod.time()
+    os.utime(fresh, (now, now - 3600))                  # 1h old → green
+    os.utime(medium, (now, now - 86400 * 4))            # 4d old → yellow
+    os.utime(old, (now, now - 86400 * 30))              # 30d old → red
+    data_index = {
+        "FRESH":  {"D1": fresh},
+        "MEDIUM": {"D1": medium},
+        "OLD":    {"D1": old},
+    }
+    rows, ng, ny, nr = ctrl.freshness_summary(data_index)
+    assert ng == 1 and ny == 1 and nr == 1
+    by_ticker = {r["ticker"]: r for r in rows}
+    assert by_ticker["FRESH"]["bucket"] == "green"
+    assert by_ticker["MEDIUM"]["bucket"] == "yellow"
+    assert by_ticker["OLD"]["bucket"] == "red"

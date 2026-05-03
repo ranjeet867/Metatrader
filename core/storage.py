@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_DDL = [
     """
@@ -82,11 +82,121 @@ SCHEMA_DDL = [
         realized_pnl    REAL,
         r_multiple      REAL,
         close_reason    TEXT,
+        -- v2 metadata (added inline so a fresh DB has them; the migration
+        -- helper handles v1 DBs that still have the older shape).
+        mode            TEXT NOT NULL DEFAULT 'backtest'
+                                CHECK (mode IN ('backtest','paper','live')),
+        strategy        TEXT,
+        tf              TEXT,
+        idempotency_key TEXT,
+        notes           TEXT,
+        mt5_ticket      INTEGER,
+        magic_number    INTEGER,
         PRIMARY KEY (run_id, trade_idx),
         FOREIGN KEY (run_id) REFERENCES runs (run_id)
     )
     """,
+    # ----- v2 additions -----
+    """
+    CREATE TABLE IF NOT EXISTS paper_runs (
+        run_id              TEXT PRIMARY KEY,
+        started_at_utc      TEXT NOT NULL,
+        finished_at_utc     TEXT,
+        status              TEXT CHECK (status IN ('running','stopped','crashed','finished')),
+        config_json         TEXT NOT NULL,
+        heartbeat_at_utc    TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS live_runs (
+        run_id              TEXT PRIMARY KEY,
+        started_at_utc      TEXT NOT NULL,
+        finished_at_utc     TEXT,
+        status              TEXT CHECK (status IN ('running','stopped','crashed','finished')),
+        config_json         TEXT NOT NULL,
+        heartbeat_at_utc    TEXT,
+        mt5_account_login   INTEGER
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS risk_state (
+        symbol              TEXT NOT NULL,
+        strategy            TEXT NOT NULL,
+        consecutive_losses  INTEGER DEFAULT 0,
+        last_loss_at_utc    TEXT,
+        cooldown_until_utc  TEXT,
+        daily_loss_pct      REAL DEFAULT 0,
+        day_start_balance   REAL,
+        PRIMARY KEY (symbol, strategy)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ftmo_daily_resets (
+        reset_at_utc        TEXT PRIMARY KEY,
+        day_start_balance   REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS parity_log (
+        strategy            TEXT NOT NULL,
+        passed_at_utc       TEXT NOT NULL,
+        divergence_dollars  REAL NOT NULL,
+        PRIMARY KEY (strategy, passed_at_utc)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS bridge_events (
+        pinged_at_utc       TEXT,
+        method              TEXT,
+        ok                  INTEGER,
+        latency_ms          INTEGER,
+        error               TEXT
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_bridge_events_time
+        ON bridge_events (pinged_at_utc)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS trade_notes (
+        trade_run_id        TEXT NOT NULL,
+        trade_idx           INTEGER NOT NULL,
+        note                TEXT,
+        updated_at_utc      TEXT,
+        PRIMARY KEY (trade_run_id, trade_idx)
+    )
+    """,
 ]
+
+
+# Idempotent column additions on existing trades table.
+# Each entry: (column_name, DDL fragment after ADD COLUMN).
+TRADES_NEW_COLUMNS: list[tuple[str, str]] = [
+    ("mode",            "TEXT NOT NULL DEFAULT 'backtest'"),
+    ("strategy",        "TEXT"),
+    ("tf",              "TEXT"),
+    ("idempotency_key", "TEXT"),
+    ("notes",           "TEXT"),
+    ("mt5_ticket",      "INTEGER"),
+    ("magic_number",    "INTEGER"),
+]
+
+
+def _existing_columns(conn, table: str) -> set[str]:
+    """Return set of column names currently on `table`. Empty if table missing."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r[1] for r in rows}
+
+
+def _migrate_trades(conn) -> None:
+    """Add columns to trades that are missing. Idempotent — never re-adds."""
+    have = _existing_columns(conn, "trades")
+    if not have:
+        # Table doesn't exist yet — CREATE TABLE will run from SCHEMA_DDL.
+        return
+    for col, ddl in TRADES_NEW_COLUMNS:
+        if col not in have:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {ddl}")
 
 
 @contextmanager
@@ -105,11 +215,14 @@ def connect(db_path: str | Path):
 
 
 def init_schema(db_path: str | Path) -> None:
-    """Create tables if they don't exist. Safe to call multiple times."""
+    """Create tables + apply column migrations. Safe to call multiple times."""
     with connect(db_path) as c:
         for ddl in SCHEMA_DDL:
             c.execute(ddl)
-        # Record version (idempotent — INSERT OR IGNORE)
+        # If we landed on a pre-v2 DB whose `trades` was created without the
+        # new columns, ALTER them in. (CREATE TABLE IF NOT EXISTS is a no-op on
+        # an existing v1 table — that's why we need this second pass.)
+        _migrate_trades(c)
         c.execute(
             "INSERT OR IGNORE INTO schema_version (version) VALUES (?)",
             (SCHEMA_VERSION,),
@@ -235,7 +348,11 @@ def finish_run(db_path: str | Path, run_id: str, *, finished_at_utc: str,
 
 
 def save_trades(db_path: str | Path, run_id: str, trades: list[dict]) -> int:
-    """Persist trade rows. Idempotent via PRIMARY KEY (run_id, trade_idx)."""
+    """Persist trade rows. Idempotent via PRIMARY KEY (run_id, trade_idx).
+
+    The trade dicts may include the v2 metadata fields (mode, strategy, tf,
+    idempotency_key, notes, mt5_ticket, magic_number); all default sensibly.
+    """
     rows = [
         (run_id, i, t["symbol"], t["direction"],
          t["opened_at_utc"], t.get("closed_at_utc"),
@@ -243,7 +360,10 @@ def save_trades(db_path: str | Path, run_id: str, trades: list[dict]) -> int:
          t.get("target_price"), t.get("exit_price"),
          float(t["lots"]),
          t.get("realized_pnl"), t.get("r_multiple"),
-         t.get("close_reason"))
+         t.get("close_reason"),
+         t.get("mode", "backtest"), t.get("strategy"), t.get("tf"),
+         t.get("idempotency_key"), t.get("notes"),
+         t.get("mt5_ticket"), t.get("magic_number"))
         for i, t in enumerate(trades)
     ]
     with connect(db_path) as c:
@@ -252,9 +372,167 @@ def save_trades(db_path: str | Path, run_id: str, trades: list[dict]) -> int:
             INSERT OR REPLACE INTO trades
               (run_id, trade_idx, symbol, direction, opened_at_utc, closed_at_utc,
                entry_price, stop_price, target_price, exit_price,
-               lots, realized_pnl, r_multiple, close_reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               lots, realized_pnl, r_multiple, close_reason,
+               mode, strategy, tf, idempotency_key, notes, mt5_ticket, magic_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# v2 paper / live / risk / parity / bridge / notes writers
+# ---------------------------------------------------------------------------
+
+def upsert_paper_run(db_path: str | Path, run_id: str, *, started_at_utc: str,
+                     status: str, config_json: str,
+                     finished_at_utc: str | None = None,
+                     heartbeat_at_utc: str | None = None) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            """
+            INSERT INTO paper_runs (run_id, started_at_utc, finished_at_utc,
+                                     status, config_json, heartbeat_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                finished_at_utc = excluded.finished_at_utc,
+                status = excluded.status,
+                heartbeat_at_utc = excluded.heartbeat_at_utc
+            """,
+            (run_id, started_at_utc, finished_at_utc, status, config_json,
+             heartbeat_at_utc),
+        )
+
+
+def heartbeat_paper_run(db_path: str | Path, run_id: str, at_utc: str) -> None:
+    with connect(db_path) as c:
+        c.execute("UPDATE paper_runs SET heartbeat_at_utc=? WHERE run_id=?",
+                   (at_utc, run_id))
+
+
+def upsert_live_run(db_path: str | Path, run_id: str, *, started_at_utc: str,
+                    status: str, config_json: str,
+                    finished_at_utc: str | None = None,
+                    heartbeat_at_utc: str | None = None,
+                    mt5_account_login: int | None = None) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            """
+            INSERT INTO live_runs (run_id, started_at_utc, finished_at_utc, status,
+                                    config_json, heartbeat_at_utc, mt5_account_login)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                finished_at_utc = excluded.finished_at_utc,
+                status = excluded.status,
+                heartbeat_at_utc = excluded.heartbeat_at_utc
+            """,
+            (run_id, started_at_utc, finished_at_utc, status, config_json,
+             heartbeat_at_utc, mt5_account_login),
+        )
+
+
+def get_risk_state(db_path: str | Path, symbol: str, strategy: str) -> dict | None:
+    with connect(db_path) as c:
+        row = c.execute(
+            "SELECT consecutive_losses, last_loss_at_utc, cooldown_until_utc, "
+            "daily_loss_pct, day_start_balance FROM risk_state "
+            "WHERE symbol=? AND strategy=?",
+            (symbol, strategy),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "symbol": symbol, "strategy": strategy,
+        "consecutive_losses": row[0],
+        "last_loss_at_utc": row[1],
+        "cooldown_until_utc": row[2],
+        "daily_loss_pct": row[3],
+        "day_start_balance": row[4],
+    }
+
+
+def upsert_risk_state(db_path: str | Path, symbol: str, strategy: str, *,
+                      consecutive_losses: int, last_loss_at_utc: str | None,
+                      cooldown_until_utc: str | None, daily_loss_pct: float,
+                      day_start_balance: float | None) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            """
+            INSERT INTO risk_state
+                (symbol, strategy, consecutive_losses, last_loss_at_utc,
+                 cooldown_until_utc, daily_loss_pct, day_start_balance)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, strategy) DO UPDATE SET
+                consecutive_losses = excluded.consecutive_losses,
+                last_loss_at_utc = excluded.last_loss_at_utc,
+                cooldown_until_utc = excluded.cooldown_until_utc,
+                daily_loss_pct = excluded.daily_loss_pct,
+                day_start_balance = excluded.day_start_balance
+            """,
+            (symbol, strategy, consecutive_losses, last_loss_at_utc,
+             cooldown_until_utc, daily_loss_pct, day_start_balance),
+        )
+
+
+def reset_risk_state_daily(db_path: str | Path, at_utc: str,
+                            day_start_balance: float) -> None:
+    """FTMO 22:00 UTC daily reset: zero consecutive_losses + daily_loss_pct,
+    update day_start_balance for ALL (symbol, strategy) pairs. Records the
+    reset in ftmo_daily_resets. Idempotent on at_utc."""
+    with connect(db_path) as c:
+        c.execute(
+            "INSERT OR IGNORE INTO ftmo_daily_resets (reset_at_utc, day_start_balance) "
+            "VALUES (?, ?)",
+            (at_utc, day_start_balance),
+        )
+        c.execute(
+            "UPDATE risk_state "
+            "SET consecutive_losses=0, daily_loss_pct=0, day_start_balance=?",
+            (day_start_balance,),
+        )
+
+
+def record_parity_pass(db_path: str | Path, strategy: str, passed_at_utc: str,
+                        divergence_dollars: float) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            "INSERT OR IGNORE INTO parity_log (strategy, passed_at_utc, "
+            "divergence_dollars) VALUES (?, ?, ?)",
+            (strategy, passed_at_utc, divergence_dollars),
+        )
+
+
+def last_parity_pass(db_path: str | Path, strategy: str) -> tuple[str, float] | None:
+    with connect(db_path) as c:
+        row = c.execute(
+            "SELECT passed_at_utc, divergence_dollars FROM parity_log "
+            "WHERE strategy=? ORDER BY passed_at_utc DESC LIMIT 1",
+            (strategy,),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
+def record_bridge_event(db_path: str | Path, pinged_at_utc: str, method: str,
+                         ok: bool, latency_ms: int, error: str | None = None) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            "INSERT INTO bridge_events (pinged_at_utc, method, ok, latency_ms, error) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pinged_at_utc, method, 1 if ok else 0, int(latency_ms), error),
+        )
+
+
+def upsert_trade_note(db_path: str | Path, run_id: str, trade_idx: int, note: str,
+                      updated_at_utc: str) -> None:
+    with connect(db_path) as c:
+        c.execute(
+            """
+            INSERT INTO trade_notes (trade_run_id, trade_idx, note, updated_at_utc)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(trade_run_id, trade_idx) DO UPDATE SET
+                note = excluded.note,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (run_id, trade_idx, note, updated_at_utc),
+        )

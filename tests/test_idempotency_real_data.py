@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from core.backtest import run_backtest
 from core.data import load_parquet
 from core.replay import replay_run
@@ -20,6 +22,15 @@ from strategies.vol_breakout import VolBreakout, VolBreakoutParams
 
 
 REPO = Path(__file__).resolve().parents[1]
+
+# These tests need the cached broker parquet to run. CI doesn't have it
+# (.gitignored), so skip cleanly with a clear reason. Locally the files
+# are present and tests run as normal.
+_REQUIRED = REPO / "data" / "US100.cash_D1.parquet"
+pytestmark = pytest.mark.skipif(
+    not _REQUIRED.exists(),
+    reason=f"requires {_REQUIRED.name} — run `make refresh-data` to populate",
+)
 
 
 def _hash_trades(trades) -> str:

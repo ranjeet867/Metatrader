@@ -103,7 +103,16 @@ def test_load_unknown_symbol_raises():
 
 
 def test_real_repo_symbol_info_loads_cleanly():
-    """Sanity-check the checked-in data/symbol_info.json validates."""
+    """Sanity-check the checked-in data/symbol_info.json validates.
+
+    Skips when the file is absent (CI doesn't ship per-account broker
+    metadata; .gitignore excludes it). Locally `scripts/refresh_symbol_info.py`
+    creates it from the live MT5 bridge."""
+    from pathlib import Path
+    repo = Path(__file__).resolve().parents[1]
+    if not (repo / "data" / "symbol_info.json").exists():
+        pytest.skip("data/symbol_info.json absent — run "
+                     "scripts/refresh_symbol_info.py with the bridge running")
     syms = load_all()
     assert "US100.cash" in syms
     # All survivor tickers must be present

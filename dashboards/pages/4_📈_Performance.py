@@ -23,6 +23,40 @@ from core import storage   # noqa: E402
 
 
 @st.cache_data(ttl=10)
+def _load_runs(db_path: str) -> pd.DataFrame:
+    """Each row = one backtest / paper / live run with its config + outcome."""
+    if not Path(db_path).exists():
+        return pd.DataFrame()
+    with storage.connect(db_path) as c:
+        try:
+            rows = c.execute("""
+                SELECT run_id, started_at_utc, finished_at_utc,
+                       symbol, tf, strategy_name, config_json,
+                       starting_balance, ending_equity, n_trades,
+                       sum_realized_pnl, equity_curve_pnl, reconciles
+                FROM runs ORDER BY started_at_utc DESC
+            """).fetchall()
+        except Exception:
+            return pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=[
+        "run_id", "started_at_utc", "finished_at_utc",
+        "symbol", "tf", "strategy", "config_json",
+        "starting_balance", "ending_equity", "n_trades",
+        "sum_realized_pnl", "equity_curve_pnl", "reconciles",
+    ])
+
+
+def _run_label(row: pd.Series) -> str:
+    """Display label for a run row."""
+    when = str(row.get("started_at_utc", ""))[:16]
+    return (f"{row['strategy']} · {row['symbol']} · {row['tf']} · "
+            f"{row['n_trades']} trades · ${row['sum_realized_pnl']:+,.0f} · "
+            f"{when}")
+
+
+@st.cache_data(ttl=10)
 def _load_trades(db_path: str) -> pd.DataFrame:
     if not Path(db_path).exists():
         return pd.DataFrame()
@@ -51,23 +85,62 @@ def _load_trades(db_path: str) -> pd.DataFrame:
     return df
 
 
-def render_filters(df: pd.DataFrame) -> pd.DataFrame:
+def render_filters(df: pd.DataFrame, runs: pd.DataFrame) -> pd.DataFrame:
+    """Render sidebar filters. The DEFAULT now scopes to the most-recent
+    single run, not every backtest ever — otherwise the page conflates
+    apples and oranges (different starting balances, different lot
+    sizes, different strategies)."""
     st.sidebar.markdown("### 🔎  Filters")
     if df.empty:
         return df
-    modes = sorted(df["mode"].dropna().unique().tolist())
+
+    # ── Run picker (the big change) ──
+    st.sidebar.markdown("**Scope**")
+    scope_options = ["Single run (most recent)", "Compare runs",
+                      "All trades (raw journal)"]
+    scope = st.sidebar.radio("scope", scope_options, index=0,
+                              key="perf_scope",
+                              label_visibility="collapsed")
+
+    f = df.copy()
+    if scope == "Single run (most recent)":
+        if not runs.empty:
+            run_labels = {r["run_id"]: _run_label(r)
+                           for _, r in runs.iterrows()}
+            chosen = st.sidebar.selectbox(
+                "run", options=list(run_labels.keys()),
+                format_func=lambda rid: run_labels[rid],
+                index=0, key="perf_single_run",
+            )
+            f = f[f["run_id"] == chosen]
+    elif scope == "Compare runs":
+        if not runs.empty:
+            run_labels = {r["run_id"]: _run_label(r)
+                           for _, r in runs.iterrows()}
+            chosen = st.sidebar.multiselect(
+                "runs", options=list(run_labels.keys()),
+                format_func=lambda rid: run_labels[rid],
+                default=list(run_labels.keys())[:3],
+                key="perf_multi_run",
+            )
+            if chosen:
+                f = f[f["run_id"].isin(chosen)]
+    # else: scope == "All trades" → no run filter
+
+    # Secondary attribute filters (within whatever runs we kept)
+    st.sidebar.markdown("**Attributes**")
+    modes = sorted(f["mode"].dropna().unique().tolist())
     sel_modes = st.sidebar.multiselect("mode", modes, default=modes,
                                           key="perf_modes")
-    strats = sorted(df["strategy"].dropna().unique().tolist())
+    strats = sorted(f["strategy"].dropna().unique().tolist())
     sel_strats = st.sidebar.multiselect("strategy", strats, default=strats,
                                            key="perf_strats")
-    syms = sorted(df["symbol"].dropna().unique().tolist())
+    syms = sorted(f["symbol"].dropna().unique().tolist())
     sel_syms = st.sidebar.multiselect("symbol", syms, default=syms,
                                          key="perf_syms")
-    reasons = sorted(df["close_reason"].dropna().unique().tolist())
+    reasons = sorted(f["close_reason"].dropna().unique().tolist())
     sel_reasons = st.sidebar.multiselect("close_reason", reasons,
                                             default=reasons, key="perf_reasons")
-    f = df.copy()
     if sel_modes:
         f = f[f["mode"].isin(sel_modes)]
     if sel_strats:
@@ -76,6 +149,9 @@ def render_filters(df: pd.DataFrame) -> pd.DataFrame:
         f = f[f["symbol"].isin(sel_syms)]
     if sel_reasons:
         f = f[f["close_reason"].isin(sel_reasons)]
+
+    # Persist scope label for the explainer line
+    st.session_state["_perf_scope_label"] = scope
     return f.reset_index(drop=True)
 
 
@@ -202,10 +278,19 @@ def render_journal_table(df: pd.DataFrame, db_path: str):
         st.toast(f"Saved {changed.sum()} note(s)", icon="💾")
 
 
-def render_basis_explainer(df: pd.DataFrame) -> None:
-    """Tell the operator exactly where these numbers come from."""
+def render_basis_explainer(df: pd.DataFrame,
+                             runs: pd.DataFrame | None) -> None:
+    """Tell the operator exactly where these numbers come from.
+
+    Source of confusion this fixes: the journal accumulates EVERY
+    backtest / paper / live run you've ever done. Showing the unfiltered
+    union conflates strategies, tickers, lot sizes, R:R configs — a
+    big +$155k cumulative number is meaningless because it adds apples
+    to oranges. The default scope is now 'single run' so the chart
+    reflects ONE coherent strategy/portfolio."""
     n = len(df)
-    if n == 0:
+    n_runs = (len(runs) if runs is not None and not runs.empty else 0)
+    if n == 0 and n_runs == 0:
         st.info(
             "**No trades yet.** This page reads from the SQLite trade "
             "journal (`data/v2.db` and per-account databases). Once "
@@ -214,13 +299,41 @@ def render_basis_explainer(df: pd.DataFrame) -> None:
             "Until then, see the **🏛️ Strategy Library** page for the "
             "expected stats from the latest grid sweep.")
         return
-    modes = ", ".join(sorted(df["mode"].dropna().unique().tolist()))
-    strats = ", ".join(sorted(df["strategy"].dropna().unique().tolist()))
+    scope = st.session_state.get("_perf_scope_label",
+                                   "Single run (most recent)")
+    modes = ", ".join(sorted(df["mode"].dropna().unique().tolist())) or "—"
+    syms = ", ".join(sorted(df["symbol"].dropna().unique().tolist())) or "—"
     st.caption(
-        f"Showing **{n} trades** from journal (`data/v2.db`). "
-        f"Modes: {modes}. Strategies: {strats}. Use the sidebar filters "
-        f"to narrow."
+        f"**Scope:** {scope}  ·  **{n} trades** "
+        f"from {n_runs} total runs in `data/v2.db`.  "
+        f"Modes: {modes}. Symbols: {syms}.  "
+        f"Switch scope in the sidebar to inspect a single run, "
+        f"compare a few, or look at the raw journal."
     )
+
+
+def render_recent_runs(runs: pd.DataFrame) -> None:
+    """A compact list of the 10 most recent runs at the top of the page,
+    so the operator can see what's in the journal at a glance."""
+    if runs is None or runs.empty:
+        return
+    with st.expander(f"📚  Recent runs in journal ({len(runs)})",
+                       expanded=False):
+        rows = []
+        for _, r in runs.head(20).iterrows():
+            rows.append({
+                "started": str(r["started_at_utc"])[:16],
+                "strategy": r["strategy"],
+                "symbol": r["symbol"],
+                "tf": r["tf"],
+                "trades": int(r["n_trades"] or 0),
+                "$ pnl": round(float(r["sum_realized_pnl"] or 0.0), 2),
+                "start_bal": round(float(r["starting_balance"] or 0.0)),
+                "reconciles": "✓" if r["reconciles"] else "⛔",
+                "run_id": r["run_id"],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                       height=min(420, 36 * (len(rows) + 1)))
 
 
 def render_projected_from_library() -> None:
@@ -270,19 +383,27 @@ def main():
                         layout="wide")
     st.title("📈  Performance")
     st.caption(
-        "What this shows: every closed trade across **backtest**, "
-        "**paper**, and **live** modes — sortable, filterable, with "
-        "P&L curve, drawdown, R distribution, attribution, and a "
-        "monthly heat map. The journal is the source of truth — "
-        "no projections here.")
+        "Every closed trade across **backtest / paper / live**, with "
+        "P&L curve, drawdown, R distribution, attribution, and a monthly "
+        "heat map. **Default scope = the most recent single run** "
+        "(the trade journal accumulates every backtest, so summing them "
+        "all together would add apples to oranges)."
+    )
     db_path = str(REPO / "data" / "v2.db")
+    runs = _load_runs(db_path)
     df_all = _load_trades(db_path)
-    render_basis_explainer(df_all)
-    if df_all.empty:
+
+    if df_all.empty and (runs is None or runs.empty):
+        render_basis_explainer(df_all, runs)
         st.markdown("---")
         render_projected_from_library()
         return
-    df = render_filters(df_all)
+
+    render_recent_runs(runs)
+
+    df = render_filters(df_all, runs)
+    render_basis_explainer(df, runs)
+
     render_metrics(df)
     render_equity(df)
     cols = st.columns(2)

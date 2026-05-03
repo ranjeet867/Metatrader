@@ -41,6 +41,22 @@ from strategies.rsi_meanrev import RsiMeanRev, RsiMeanRevParams
 from strategies.vol_breakout import VolBreakout, VolBreakoutParams
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Module-level skip when broker parquets are absent. CI doesn't ship them
+# (.gitignored personal data); locally `make refresh-data` populates them.
+_REQUIRED_PARQUETS = [
+    REPO_ROOT / "data" / "US100.cash_D1.parquet",
+    REPO_ROOT / "data" / "EURUSD_H1.parquet",
+]
+_MISSING = [p.name for p in _REQUIRED_PARQUETS if not p.exists()]
+pytestmark = pytest.mark.skipif(
+    bool(_MISSING),
+    reason=("requires broker parquets " + ", ".join(_MISSING)
+            + " — run `make refresh-data` to populate"),
+)
+
+
 REPO = Path(__file__).resolve().parents[1]
 
 

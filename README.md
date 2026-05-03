@@ -47,7 +47,19 @@ make setup        # create venv, install deps
 make test         # all tests must pass
 make load-data    # fetch US100.cash H1 from MT5 bridge → parquet
 make backtest     # run EMA cross backtest on locked data
+make dashboard    # launch the Streamlit control dashboard at :8501
 ```
+
+## Control dashboard
+
+A Streamlit dashboard at `dashboards/control.py` wraps the backtester for
+interactive exploration: pick a ticker / timeframe / strategy, tune params,
+inspect equity + drawdown + trade tape + reconciliation badge live. There's a
+Sweep tab for multi-cell grids with a heatmap, and a Paper tab (UI stub —
+real execution still needs MT5 Strategy Tester parity verification first).
+
+Every run on the dashboard goes through `core.backtest.run_backtest` — the
+dashboard never re-implements PnL math. See `dashboards/README.md` for details.
 
 ## Acceptance criteria for each phase
 

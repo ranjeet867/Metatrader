@@ -4,7 +4,7 @@ PYBIN := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 PYTEST := $(VENV)/bin/pytest
 
-.PHONY: help setup test test-fast test-cov lint clean load-data backtest
+.PHONY: help setup test test-fast test-cov lint clean load-data backtest dashboard
 
 help:
 	@echo ""
@@ -93,6 +93,10 @@ sweep-grid:
 	  --slippage-atr-frac $(or $(SLIP),0.1) \
 	  --train-pct $(or $(TRAIN),0.6) \
 	  $(if $(LONGONLY),--long-only,)
+
+# Streamlit control dashboard (Backtest / Refresh / Sweep / Paper-stub)
+dashboard:
+	$(VENV)/bin/streamlit run dashboards/control.py
 
 clean:
 	rm -rf $(VENV) .pytest_cache .ruff_cache **/__pycache__

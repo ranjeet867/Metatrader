@@ -22,6 +22,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from core.backtest import partition_train_test, run_backtest   # noqa: E402
+from core.backtest_stats import compute_full_stats   # noqa: E402
 from core.config import load_config   # noqa: E402
 from core.data import load_parquet   # noqa: E402
 from core.symbol_info_loader import try_load as try_load_symbol_info   # noqa: E402
@@ -229,6 +230,52 @@ def render_backtest_section(strategies, data_index, cfg):
                     delta=f"${r.equity_curve_pnl:+,.0f}")
     cols[5].metric("skipped", f"{r.skipped_signals}",
                     help="signals dropped because in_no_entry_window")
+
+    # ── Full-stats grid (DD %, recovery, R:R, expectancy, CAGR) ──────────
+    if n > 0:
+        stats = compute_full_stats(r, starting_balance=meta["balance"])
+        st.markdown("**📊 Full stats**")
+        s1 = st.columns(5)
+        s1[0].metric("Max DD",
+                       f"{stats.max_dd_pct:.1f}%",
+                       delta=f"-${stats.max_dd_dollars:,.0f}",
+                       delta_color="inverse")
+        s1[1].metric("DD duration", f"{stats.max_dd_duration_days:.0f}d")
+        if stats.recovery_duration_days is None:
+            s1[2].metric("Recovery", "not yet",
+                            help="Equity hasn't reclaimed previous peak.")
+        else:
+            s1[2].metric("Recovery", f"{stats.recovery_duration_days:.0f}d")
+        s1[3].metric("Max consec wins", stats.max_consec_wins)
+        s1[4].metric("Max consec losses", stats.max_consec_losses,
+                        delta_color="inverse")
+
+        s2 = st.columns(5)
+        s2[0].metric("Avg win", f"${stats.avg_win_dollars:+,.2f}")
+        s2[1].metric("Avg loss", f"${stats.avg_loss_dollars:+,.2f}",
+                        delta_color="inverse")
+        rr = stats.risk_reward_ratio
+        s2[2].metric("R:R ratio",
+                       "inf" if rr == float("inf") else f"{rr:.2f}",
+                       help="avg_win / |avg_loss|. >1 = wins outsize losses.")
+        s2[3].metric("Expectancy",
+                       f"${stats.expectancy_dollars:+,.2f}",
+                       help="Mean P&L per trade.")
+        if stats.cagr_pct is None:
+            s2[4].metric("CAGR",
+                            f"{(stats.sum_realized / meta['balance'] * 100):+.1f}%",
+                            help=f"Span {stats.span_days:.0f}d — "
+                                 "too short to annualise; total return shown.")
+        else:
+            s2[4].metric("CAGR", f"{stats.cagr_pct:+.1f}%",
+                            help=f"Annualised over {stats.span_days:.0f} days.")
+
+        st.caption(
+            f"Largest single win: ${stats.largest_win_dollars:+,.2f}  ·  "
+            f"largest single loss: ${stats.largest_loss_dollars:+,.2f}  ·  "
+            f"avg trade duration: {stats.avg_trade_bars:.1f} bars  ·  "
+            f"sharpe-on-R: {stats.sharpe_R:.2f}"
+        )
 
     # Sizing summary
     if meta.get("sizing_mode") == "risk %":

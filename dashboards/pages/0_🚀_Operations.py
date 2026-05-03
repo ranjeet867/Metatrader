@@ -1,17 +1,17 @@
 """
 0_🚀_Operations.py — the trader's front door.
 
-Multi-account view: switch FTMO accounts, see deployment cards (one per
-strategy×ticker×tf), manage open positions, see today's broker statement,
-and go live with typed-confirm pre-flight gates.
-
-Numbered 0 so Streamlit auto-discovery puts it first.
+Layout (top→bottom):
+  1. Emergency-stop banner (always visible)
+  2. Account switcher row (compact)
+  3. KPI strip (8 cells, full width — balance / equity / unrealized /
+     today / daily-buffer / total-buffer / profit-progress / next FTMO close)
+  4. Tabs:  📊 Deployments | 💼 Positions | 📜 Statement | 📈 Equity | 🛠 Settings
+  5. Add-deployment expander, Go-Live modal, etc.
 """
 from __future__ import annotations
 
 import sys
-import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -34,13 +34,16 @@ from core.risk_engine import LiveRiskTracker   # noqa: E402
 from core.time_guards import time_guard_cfg_from_risk_config   # noqa: E402
 from dashboards.components import (   # noqa: E402
     account_switcher,
+    active_runs_panel,
+    activity_log_panel,
     deployment_card,
+    deployment_dialogs,
     emergency_stop_bar,
-    ftmo_progress,
-    go_live_modal,
+    kpi_strip,
     live_equity_chart,
     position_manager_panel,
     statement_panel,
+    theme,
 )
 from dashboards.components.account_switcher import (   # noqa: E402
     get_active_login,
@@ -49,6 +52,10 @@ from dashboards.components.state import (   # noqa: E402
     discover_strategies,
 )
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 @st.cache_resource
 def _bridge() -> MT5AccountClient:
@@ -64,53 +71,35 @@ def _build_clock(account: account_manager.Account) -> FtmoClock:
 
 
 def _ensure_seed_deployments(login: int) -> None:
-    """First-time visitors get the 6 survivors pre-filled."""
     if not dep_mod.load_deployments(login):
         dep_mod.seed_survivor_deployments(login)
-
-
-def _account_card(account: account_manager.Account, summary, container) -> None:
-    container.markdown(f"### 🏦 {account.alias}")
-    container.caption(f"login `{account.login}` · type `{account.type}`"
-                        f" · tz `{account.user_tz}`")
-    if summary is None:
-        container.info("Bridge offline — account info unavailable.")
-        return
-    cols = container.columns(2)
-    cols[0].metric("Balance", f"${summary.current_balance:,.2f}")
-    cols[1].metric("Equity", f"${summary.current_equity:,.2f}")
-    cols2 = container.columns(2)
-    cols2[0].metric("Today realized",
-                       f"${summary.realized_pnl_today:+,.2f}")
-    cols2[1].metric("Total realized",
-                       f"${summary.realized_pnl_total:+,.2f}")
 
 
 def _add_deployment_form(login: int) -> None:
     strats = discover_strategies()
     with st.expander("➕  Add a deployment", expanded=False):
-        with st.form(f"add_dep_{login}"):
+        with st.form(f"add_dep_{login}", clear_on_submit=True):
             cols = st.columns(3)
             sname = cols[0].selectbox("strategy", sorted(strats.keys()),
-                                          key=f"adddep_s_{login}")
+                                      key=f"adddep_s_{login}")
             ticker = cols[1].text_input("ticker", value="US100.cash",
-                                            key=f"adddep_t_{login}")
+                                        key=f"adddep_t_{login}")
             tf = cols[2].selectbox("tf", ["M15", "H1", "H4", "D1"],
-                                       index=3, key=f"adddep_tf_{login}")
+                                   index=3, key=f"adddep_tf_{login}")
             cols2 = st.columns(3)
             risk = float(cols2[0].number_input("risk %/trade",
-                                                    value=0.3, step=0.1,
-                                                    format="%.2f",
-                                                    key=f"adddep_r_{login}"))
+                                               value=0.3, step=0.1,
+                                               format="%.2f",
+                                               key=f"adddep_r_{login}"))
             cap = float(cols2[1].number_input("daily cap %",
-                                                  value=1.0, step=0.5,
-                                                  format="%.2f",
-                                                  key=f"adddep_c_{login}"))
+                                              value=1.0, step=0.5,
+                                              format="%.2f",
+                                              key=f"adddep_c_{login}"))
             long_only = cols2[2].checkbox("long only", value=True,
-                                              key=f"adddep_lo_{login}")
+                                          key=f"adddep_lo_{login}")
             if st.form_submit_button("Add deployment"):
                 slug = (Deployment.slug(sname, ticker, tf)
-                          + ("_long" if long_only else "_bidir"))
+                        + ("_long" if long_only else "_bidir"))
                 dep = Deployment(
                     deployment_id=slug,
                     strategy=sname, ticker=ticker, tf=tf,
@@ -124,16 +113,55 @@ def _add_deployment_form(login: int) -> None:
                 st.rerun()
 
 
-def main():
-    st.set_page_config(page_title="Operations", page_icon="🚀", layout="wide")
-    st.title("🚀  Operations")
-    st.caption(
-        "Daily-driver view. Switch accounts at the top, manage deployments + "
-        "positions in the cards below. The detailed research views are on "
-        "the other pages (Backtest, Strategy Studio, etc.)."
+def _account_meta_row(account: account_manager.Account,
+                       summary, login: int) -> None:
+    """A compact row beneath the account switcher: alias · login · type ·
+    timezone · 'reset baseline' tool when the account is past its loss
+    limit."""
+    cols = st.columns([5, 2])
+    cols[0].markdown(
+        f"<span style='color:#9ca3af;font-family:ui-monospace,Menlo,monospace;"
+        f"font-size:0.86rem;'>"
+        f"<b style='color:#e5e7eb;'>{account.alias}</b> · "
+        f"login <code>{account.login}</code> · type <code>{account.type}</code>"
+        f" · tz <code>{account.user_tz}</code></span>",
+        unsafe_allow_html=True,
     )
+    # Offer "reset baseline" if the account has crossed FTMO total-loss
+    # cap. Useful for re-anchoring sandboxed/already-blown accounts.
+    if summary is not None:
+        baseline = account.effective_baseline_equity
+        cap_dollars = baseline * account.total_loss_cap_pct / 100.0
+        loss = max(0.0, baseline - summary.current_equity)
+        if loss >= cap_dollars * 0.9 and summary.current_equity > 0:
+            with cols[1].popover("⚠ Re-anchor baseline"):
+                st.warning(
+                    f"This account is at {loss/cap_dollars*100:.0f}% of its "
+                    f"FTMO total-loss cap relative to baseline "
+                    f"${baseline:,.0f}. If you're using it as a sandbox, "
+                    f"set the baseline to current equity to make the buffer "
+                    f"math meaningful again."
+                )
+                if st.button(
+                    f"Set baseline = ${summary.current_equity:,.0f}",
+                    type="primary", key=f"reset_baseline_{login}",
+                ):
+                    account_manager.reset_baseline_to_current(
+                        login, summary.current_equity)
+                    st.toast("Baseline reset.")
+                    st.rerun()
 
-    # 1. Emergency stop bar (sticky-ish at top)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    st.set_page_config(page_title="Operations", page_icon="🚀",
+                       layout="wide")
+    theme.inject_css()
+
+    # 1. Emergency stop banner
     emergency_stop_bar.render()
 
     # 2. Account switcher
@@ -144,15 +172,12 @@ def main():
         return
     account = account_manager.get_account(login)
     if account is None:
-        st.error(f"No account for login {login}")
+        st.error(f"No account record for login {login}")
         return
 
     _ensure_seed_deployments(login)
 
-    # 3. Account detail + FTMO progress (right column), main content (left)
-    main_col, side_col = st.columns([3, 1])
-
-    # Build live components
+    # 3. Build the live components
     bridge = _bridge()
     cfg = load_config()
     tg_cfg = time_guard_cfg_from_risk_config(cfg)
@@ -166,59 +191,93 @@ def main():
     )
     parity_gate = ParityGate(db_path)
 
-    # Account info / statement (best-effort — bridge may be offline)
+    # 4. Statement snapshot (best-effort — bridge may be offline)
     summary = None
+    statement = None
+    statement_err = None
     try:
         statement = StatementReader(
             account_login=login, bridge=bridge,
             ftmo_rules=clock.rules,
-            account_baseline=100_000,
+            account_baseline=account.effective_baseline_equity,
+            daily_loss_cap_pct=account.daily_loss_cap_pct,
+            total_loss_cap_pct=account.total_loss_cap_pct,
         )
         summary = statement.snapshot()
     except Exception as e:
-        st.caption(f"(statement unavailable: {e})")
+        statement_err = str(e)
 
-    # Right side
-    with side_col:
-        _account_card(account, summary, st)
-        if summary is not None:
-            ftmo_progress.render(
-                account_login=login,
-                baseline_equity=summary.starting_equity,
-                current_equity=summary.current_equity,
-                realized_today=summary.realized_pnl_today,
-                unrealized=summary.unrealized_pnl,
-                container=st,
+    _account_meta_row(account, summary, login)
+
+    # 5. KPI strip (full width)
+    kpi_strip.render(account=account, summary=summary, clock=clock)
+
+    if summary is None:
+        # Differentiate offline-bridge vs old-bridge-EA. The latter is
+        # common when the user hasn't upgraded their MT5 EA yet.
+        msg = statement_err or ""
+        if "unknown method" in msg or "not implemented" in msg.lower():
+            st.warning(
+                "ℹ Your MT5 bridge EA is missing Phase 2.5 methods "
+                "(`positions_get`, `history_deals_get`). Live KPIs are "
+                "showing baseline only. Upgrade the EA when convenient — "
+                "see `docs/RUNBOOK.md`."
+            )
+        else:
+            st.caption(
+                f"⚠ Bridge offline — KPIs show baseline / countdowns only. "
+                f"({msg or 'no error'})"
             )
 
-    # Main content
-    with main_col:
-        deployments = dep_mod.load_deployments(login)
-        st.markdown(f"## Deployments ({len(deployments)})")
+    st.markdown("")  # vertical breathing room
 
-        # Modal trigger flag (persisted in session state)
-        _SHOW_MODAL_KEY = "_ops_show_go_live_for"
-        # Render each card
+    # 6. Tabs
+    tab_dep, tab_runs, tab_pos, tab_stmt, tab_eq, tab_log, tab_settings = (
+        st.tabs([
+            "📊 Deployments", "▶ Active runs", "💼 Positions",
+            "📜 Statement", "📈 Equity history",
+            "📜 Activity log", "🛠 Settings",
+        ])
+    )
+
+    # ----- Deployments tab -----
+    with tab_dep:
+        deployments = dep_mod.load_deployments(login)
+        st.markdown(
+            f"**{len(deployments)} deployments configured** for this account."
+        )
+
         for d in deployments:
-            def _on_go_live(dep, _login=login):
-                st.session_state[_SHOW_MODAL_KEY] = dep.deployment_id
+            def _on_backtest(dep, _login=login):
+                deployment_dialogs.open_dialog("backtest", dep.deployment_id)
 
             def _on_paper(dep, _login=login):
-                dep_mod.update_status(_login, dep.deployment_id, "paper")
-                st.toast(f"📡 {dep.deployment_id} → PAPER")
+                deployment_dialogs.open_dialog("paper", dep.deployment_id)
+
+            def _on_go_live(dep, _login=login):
+                deployment_dialogs.open_dialog("go_live", dep.deployment_id)
 
             def _on_pause(dep, _login=login):
+                # Pause is fast — no dialog; just toggle and toast.
                 new_status = "paused" if dep.status != "paused" else "idle"
                 dep_mod.update_status(_login, dep.deployment_id, new_status)
-                st.toast(f"⏸ {dep.deployment_id} → {new_status.upper()}")
+                # Audit so the activity log shows it
+                try:
+                    JournalWriter(db_path).record_bridge_event(
+                        method=("pause_deployment"
+                                  if new_status == "paused"
+                                  else "resume_deployment"),
+                        latency_ms=0, ok=True,
+                        error=f"deployment={dep.deployment_id}",
+                    )
+                except Exception:
+                    pass
+                st.toast(f"{'⏸' if new_status == 'paused' else '▶'} "
+                            f"{dep.deployment_id} → {new_status.upper()}")
+                st.rerun()
 
             def _on_remove(dep, _login=login):
-                dep_mod.remove_deployment(_login, dep.deployment_id)
-                st.toast(f"🗑 removed {dep.deployment_id}")
-
-            def _on_backtest(dep, _login=login):
-                # Push to Page 1 via session_state and offer a hint
-                st.toast("Open Page 1 (Backtest) — params will be set there.")
+                deployment_dialogs.open_dialog("remove", dep.deployment_id)
 
             deployment_card.render(
                 login=login, dep=d,
@@ -229,61 +288,114 @@ def main():
 
         _add_deployment_form(login)
 
-        # Go-Live modal (rendered when the flag is set)
-        modal_for = st.session_state.get(_SHOW_MODAL_KEY)
-        if modal_for is not None:
-            target_dep = next((d for d in deployments
-                                if d.deployment_id == modal_for), None)
-            if target_dep is not None:
-                with st.container(border=True):
-                    confirmed = go_live_modal.render_modal(
-                        login=login, dep=target_dep, cfg=cfg,
-                        parity_gate=parity_gate, risk_tracker=risk_tracker,
-                        time_guard_cfg=tg_cfg, ftmo_clock=clock,
-                        account_baseline=summary.starting_equity if summary else 100_000,
-                    )
-                    if confirmed:
-                        # Final action: in this build the live executor is
-                        # mocked at runtime — flip the deployment status
-                        # to live and surface a clear message.
-                        dep_mod.update_status(login, target_dep.deployment_id, "live")
-                        # Audit
-                        try:
-                            JournalWriter(db_path).record_bridge_event(
-                                method="ui_go_live_confirmed",
-                                latency_ms=0, ok=True,
-                                error=f"deployment={target_dep.deployment_id}",
-                            )
-                        except Exception:
-                            pass
-                        st.session_state.pop(_SHOW_MODAL_KEY, None)
-                        st.toast(f"🚀 LIVE: {target_dep.deployment_id}")
-                        st.rerun()
+        # Render whichever dialog was requested by a button click.
+        deployment_dialogs.render_active_dialog(
+            deployments=deployments, login=login,
+            cfg=cfg, parity_gate=parity_gate,
+            risk_tracker=risk_tracker, time_guard_cfg=tg_cfg,
+            ftmo_clock=clock,
+            account_baseline=(
+                summary.starting_equity if summary
+                else account.effective_baseline_equity),
+        )
 
-        # Position manager panel
-        st.markdown("---")
+    # ----- Active runs tab -----
+    with tab_runs:
+        active_runs_panel.render(login=login)
+
+    # ----- Positions tab -----
+    with tab_pos:
         try:
             pm = PositionManager(account_login=login, bridge=bridge,
-                                  db_path=db_path)
+                                 db_path=db_path)
             position_manager_panel.render(pm=pm)
         except Exception as e:
             st.caption(f"(position manager unavailable: {e})")
 
-        # Statement panel
-        if summary is not None:
-            st.markdown("---")
+    # ----- Statement tab -----
+    with tab_stmt:
+        if summary is None:
+            st.info("Bridge offline — statement unavailable.")
+        else:
             statement_panel.render(summary=summary, clock=clock,
-                                     user_tz_name=account.user_tz)
+                                     user_tz_name=account.user_tz,
+                                     account_type=account.type,
+                                     total_loss_cap_pct=account.total_loss_cap_pct)
 
-        # Equity history chart (broker-truth)
-        if summary is not None:
-            st.markdown("---")
+    # ----- Equity history tab -----
+    with tab_eq:
+        if statement is None or summary is None:
+            st.info("Bridge offline — equity history unavailable.")
+        else:
             try:
-                curve = statement.daily_pnl_curve(days=30)
-                live_equity_chart.render(daily_curve=curve,
-                                            baseline_equity=summary.starting_equity)
+                curve = statement.daily_pnl_curve(days=60)
+                live_equity_chart.render(
+                    daily_curve=curve,
+                    baseline_equity=summary.starting_equity,
+                )
             except Exception as e:
                 st.caption(f"(equity chart unavailable: {e})")
+
+    # ----- Activity log tab -----
+    with tab_log:
+        activity_log_panel.render(login=login, hours=24)
+
+    # ----- Settings tab -----
+    with tab_settings:
+        st.markdown("### Per-account settings")
+        with st.form(f"acct_settings_{login}"):
+            cols = st.columns(2)
+            new_alias = cols[0].text_input("alias", value=account.alias)
+            new_tz = cols[1].text_input("timezone (IANA)", value=account.user_tz)
+            cols2 = st.columns(3)
+            new_baseline = float(cols2[0].number_input(
+                "Risk baseline equity ($)",
+                value=float(account.effective_baseline_equity),
+                step=1_000.0, min_value=0.0,
+                help="0 to infer from type. Used for FTMO buffer math.",
+            ))
+            new_daily_cap = float(cols2[1].number_input(
+                "Daily loss cap (%)",
+                value=float(account.daily_loss_cap_pct),
+                step=0.5, min_value=0.5, max_value=10.0,
+            ))
+            new_total_cap = float(cols2[2].number_input(
+                "Total loss cap (%)",
+                value=float(account.total_loss_cap_pct),
+                step=0.5, min_value=1.0, max_value=20.0,
+            ))
+            cols3 = st.columns(2)
+            new_profit_target = float(cols3[0].number_input(
+                "Profit target (%)",
+                value=float(account.profit_target_pct),
+                step=0.5, min_value=1.0, max_value=20.0,
+            ))
+            new_days_required = int(cols3[1].number_input(
+                "Min trading days",
+                value=int(account.days_required),
+                step=1, min_value=0, max_value=60,
+            ))
+            if st.form_submit_button("Save settings", type="primary"):
+                account_manager.update_account(
+                    login,
+                    alias=new_alias, user_tz=new_tz,
+                    risk_baseline_equity=new_baseline,
+                    daily_loss_cap_pct=new_daily_cap,
+                    total_loss_cap_pct=new_total_cap,
+                    profit_target_pct=new_profit_target,
+                    days_required=new_days_required,
+                )
+                st.success("Saved.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Danger zone")
+        if st.button("🗑 Remove this account from registry",
+                      help="Does NOT delete the data/accounts/{login}/ folder."):
+            account_manager.remove_account(login)
+            st.session_state.pop("_active_account_login", None)
+            st.toast(f"Removed account {login}.")
+            st.rerun()
 
 
 main()

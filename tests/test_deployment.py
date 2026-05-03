@@ -70,10 +70,15 @@ def test_update_status():
 
 
 def test_seed_survivors_idempotent():
+    """Second call must return the same set as the first — no growth.
+
+    Count isn't pinned because the seed list is derived from
+    core.strategy_library (when grid_results.md is present) or from a
+    static fallback otherwise. What matters is idempotency."""
     n1 = len(seed_survivor_deployments(1))
     n2 = len(seed_survivor_deployments(1))    # second call adds nothing
-    assert n1 == 6
-    assert n2 == 6
+    assert n1 == n2
+    assert n1 >= 4
 
 
 def test_slug_filesystem_safe():

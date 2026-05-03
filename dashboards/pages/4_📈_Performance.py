@@ -11,7 +11,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -203,11 +202,86 @@ def render_journal_table(df: pd.DataFrame, db_path: str):
         st.toast(f"Saved {changed.sum()} note(s)", icon="💾")
 
 
+def render_basis_explainer(df: pd.DataFrame) -> None:
+    """Tell the operator exactly where these numbers come from."""
+    n = len(df)
+    if n == 0:
+        st.info(
+            "**No trades yet.** This page reads from the SQLite trade "
+            "journal (`data/v2.db` and per-account databases). Once "
+            "you click 📊 Backtest, 📡 Paper, or 🚀 Go Live, the "
+            "trades land here automatically.\n\n"
+            "Until then, see the **🏛️ Strategy Library** page for the "
+            "expected stats from the latest grid sweep.")
+        return
+    modes = ", ".join(sorted(df["mode"].dropna().unique().tolist()))
+    strats = ", ".join(sorted(df["strategy"].dropna().unique().tolist()))
+    st.caption(
+        f"Showing **{n} trades** from journal (`data/v2.db`). "
+        f"Modes: {modes}. Strategies: {strats}. Use the sidebar filters "
+        f"to narrow."
+    )
+
+
+def render_projected_from_library() -> None:
+    """When the journal is empty, show what the recommended portfolio
+    is *expected* to deliver based on grid_results.md stats.
+
+    This is NOT a forecast — it's "if every recommended strategy
+    delivered its OOS stats this month, this is the picture you'd
+    see". Operators use this to sanity-check whether the portfolio
+    even targets the FTMO profit goal."""
+    from core import strategy_library
+
+    lib = [e for e in strategy_library.list_library() if e.recommended]
+    if not lib:
+        return
+    rows = []
+    for e in lib:
+        if not e.edge:
+            continue
+        rows.append({
+            "strategy": e.strategy,
+            "ticker": e.ticker,
+            "tf": e.tf,
+            "n_test": e.edge.n_test,
+            "PF_test": round(e.edge.test_pf, 2),
+            "R_test (OOS)": round(e.edge.test_r, 3),
+            "win_rate ≈": (
+                f"{(0.5 + e.edge.test_r / 4) * 100:.0f}%"
+                if -2 < e.edge.test_r < 2 else "—"),
+            "why": e.why,
+        })
+    if not rows:
+        return
+    st.markdown("### 🔮  Expected stats from the recommended portfolio")
+    st.caption(
+        "OOS R-multiples from `make sweep-grid` on real broker data. "
+        "These are **out-of-sample** — the strategy was fit on the first "
+        "60% of bars, evaluated on the last 40%. Win rate is a rough "
+        "proxy from R; verify per strategy on the Strategy Library "
+        "scatter plot.")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                   height=min(360, 36 * (len(rows) + 1)))
+
+
 def main():
-    st.set_page_config(page_title="Performance", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Performance", page_icon="📈",
+                        layout="wide")
     st.title("📈  Performance")
+    st.caption(
+        "What this shows: every closed trade across **backtest**, "
+        "**paper**, and **live** modes — sortable, filterable, with "
+        "P&L curve, drawdown, R distribution, attribution, and a "
+        "monthly heat map. The journal is the source of truth — "
+        "no projections here.")
     db_path = str(REPO / "data" / "v2.db")
     df_all = _load_trades(db_path)
+    render_basis_explainer(df_all)
+    if df_all.empty:
+        st.markdown("---")
+        render_projected_from_library()
+        return
     df = render_filters(df_all)
     render_metrics(df)
     render_equity(df)

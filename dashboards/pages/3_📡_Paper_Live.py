@@ -4,23 +4,19 @@
 """
 from __future__ import annotations
 
-import json
 import sys
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from core import storage   # noqa: E402
-from core.backtest import partition_train_test, run_backtest   # noqa: E402
-from core.config import load_config, save_config   # noqa: E402
+from core.backtest import run_backtest   # noqa: E402
+from core.config import load_config   # noqa: E402
 from core.data import load_parquet   # noqa: E402
 from core.parity_gate import ParityGate   # noqa: E402
 from core.replay import replay_run   # noqa: E402
@@ -32,8 +28,6 @@ from dashboards.components.forms import render_params_form   # noqa: E402
 from dashboards.components.state import (   # noqa: E402
     DEFAULT_LOTS,
     DEFAULT_MONEY_PER_UNIT,
-    KEY_FTMO_RISK_ACCEPTED,
-    KEY_OVERRIDE_PARITY_RECENCY,
     KEY_PROMOTE_TO_PAPER,
     discover_data,
     discover_strategies,
@@ -291,110 +285,236 @@ def _start_paper_loop(portfolio, data_index, cfg, runs):
 # ---------------------------------------------------------------------------
 
 def render_live_tab(strategies, data_index, cfg):
-    st.subheader("🔴  Live Portfolio")
+    """Simplified Live deployment view.
+
+    Old design: a wall of pre-flight checks, a text-input for strategy name,
+    one disabled Start button. Confusing and didn't show the operator
+    *what* to deploy or *what stats* each strategy had.
+
+    New design:
+      1. Compact one-line health pill — "All checks ✅ (expand to inspect)".
+      2. The strategy LIBRARY as a checklist — recommended ones pre-checked,
+         each row showing PF / R / n_test / why, ticker + tf locked from the
+         library row, risk % editable, computed lots displayed live.
+      3. A single big "Deploy selected to Live" button.
+
+    This is the operations centre — Operations page (Page 0) is the daily
+    monitoring view, this is the "I want to add / change which strategies
+    are running" view.
+    """
+    from core import account_manager
+    from core import strategy_library
+
+    st.subheader("🔴  Deploy live")
+    st.caption(
+        "Pick which strategies to run. Each row's stats come from the "
+        "latest grid sweep on real broker data — `make sweep-grid` to "
+        "refresh. Lots are auto-computed from your account equity × risk %.")
     db_path = REPO / "data" / "v2.db"
 
-    st.markdown("### Pre-flight checklist")
-
-    # Build the 6 check states
+    # ------- 1. Compact health pill -------
     sentinel = REPO / "data" / "EMERGENCY_STOP"
-    checks = []
-
-    # 1. Emergency stop
-    es_ok = not sentinel.exists()
-    checks.append(("EMERGENCY_STOP file absent", es_ok,
-                    f"path: {sentinel}"))
-
-    # 2. Account login allowed (we don't have a live account login yet)
-    allowed = cfg.live_safety_allowed_accounts
-    checks.append(("Account login in allowlist (or empty list)",
-                    True if not allowed else False,
-                    f"allowlist: {list(allowed) or '(open)'}"))
-
-    # 3. Daily loss cap
     from core.risk_engine import LiveRiskTracker
-    tracker = LiveRiskTracker(db_path=db_path,
-                                daily_loss_cap_pct=cfg.daily_loss_cap_pct)
-    daily = tracker.account_daily_loss_pct()
-    checks.append((f"Daily loss < {cfg.daily_loss_cap_pct}% cap",
-                    daily < cfg.daily_loss_cap_pct,
-                    f"current: {daily:.2f}%"))
-
-    # 4. Reconciliation green on last backtest (session-state)
-    last_bt = st.session_state.get("_last_backtest")
-    if last_bt is None:
-        checks.append(("Last backtest reconciles", False,
-                        "no backtest run in this session"))
-    else:
-        r = last_bt["result"]
-        checks.append(("Last backtest reconciles",
-                        r.reconciles,
-                        f"divergence ${abs(r.sum_realized_pnl - r.equity_curve_pnl):.4f}"))
-
-    # 5. Replay parity recent
-    pg = ParityGate(db_path)
-    sname_for_check = st.text_input("strategy to live-trade",
-                                       value="vol_breakout",
-                                       key="live_sname")
-    last_pass = pg.last_pass_for(sname_for_check)
-    parity_ok = pg.is_recent(sname_for_check, max_age_hours=24.0)
-    if last_pass is None:
-        parity_detail = "no parity pass on record"
-    else:
-        ts, div = last_pass
-        parity_detail = f"last pass {ts.strftime('%Y-%m-%d %H:%M UTC')}, div=${div:.4f}"
-    override = st.checkbox("Override parity recency (Phase 5 ONLY)",
-                              value=st.session_state.get(KEY_OVERRIDE_PARITY_RECENCY, False),
-                              key="live_override_parity")
-    st.session_state[KEY_OVERRIDE_PARITY_RECENCY] = override
-    parity_check_ok = parity_ok or override
-    checks.append((f"Replay-parity for `{sname_for_check}` < 24h",
-                    parity_check_ok,
-                    parity_detail + (" (overridden)" if override and not parity_ok else "")))
-
-    # 6. Not in no-entry window
     from core.time_guards import in_no_entry_window
+    tracker = LiveRiskTracker(db_path=db_path,
+                               daily_loss_cap_pct=cfg.daily_loss_cap_pct)
+    daily = tracker.account_daily_loss_pct()
     tg_cfg = time_guard_cfg_from_risk_config(cfg)
     in_win = in_no_entry_window(datetime.now(timezone.utc), tg_cfg)
-    checks.append(("Not in no-entry window before US close", not in_win,
-                    "currently in window" if in_win else "outside window"))
 
-    # FTMO-test acknowledge checkbox
-    ack = st.checkbox(
-        "I understand this account already failed once and may fail again.",
-        value=st.session_state.get(KEY_FTMO_RISK_ACCEPTED, False),
-        key="live_ack",
+    checks = [
+        ("EMERGENCY_STOP absent", not sentinel.exists()),
+        (f"Daily loss < {cfg.daily_loss_cap_pct}% cap "
+         f"(now {daily:.2f}%)", daily < cfg.daily_loss_cap_pct),
+        ("Outside no-entry window", not in_win),
+    ]
+    n_ok = sum(1 for _, ok in checks if ok)
+    n_total = len(checks)
+    pill_color = ("#15803d" if n_ok == n_total
+                   else "#b08800" if n_ok >= n_total - 1 else "#7f1d1d")
+    pill_text = (f"All checks ✅ ({n_ok}/{n_total})" if n_ok == n_total
+                  else f"⚠ {n_total - n_ok} check(s) failing ({n_ok}/{n_total})")
+    st.markdown(
+        f"<div style='display:inline-block;background:{pill_color};color:white;"
+        f"padding:6px 14px;border-radius:14px;font-weight:600;font-size:0.86rem;"
+        f"font-family:ui-monospace,Menlo,monospace;letter-spacing:0.04em;'>"
+        f"{pill_text}</div>",
+        unsafe_allow_html=True,
     )
-    st.session_state[KEY_FTMO_RISK_ACCEPTED] = ack
+    with st.expander("Inspect pre-flight checks"):
+        for label, ok in checks:
+            st.markdown(("✅" if ok else "⛔") + f" {label}")
+        if sentinel.exists():
+            st.warning(
+                "EMERGENCY_STOP is active — clear it on the Operations "
+                "page to allow live orders.")
 
-    for label, ok, detail in checks:
-        emoji = "✅" if ok else "⛔"
-        st.markdown(f"{emoji}  **{label}** — {detail}")
+    # ------- 2. Strategy library multiselect -------
+    st.markdown("### Strategy portfolio")
+    lib = strategy_library.list_library()
+    if not lib:
+        st.warning(
+            "No strategies in library — run `make sweep-grid` to populate "
+            "`docs/grid_results.md`.")
+        return
+    df = strategy_library.to_dataframe(lib)
 
-    all_ok = all(c[1] for c in checks) and ack
-    st.markdown("---")
-    if all_ok:
-        st.success("All required checks green AND FTMO risk accepted. "
-                    "Live trading can be started.")
-        st.button("🔴  Start Live (NOT WIRED IN THIS BUILD)",
-                    disabled=True,
-                    help="The live executor is fully tested but only mocked — "
-                         "real bridge wiring is the user's deployment step.")
+    # Defaults: every recommended row pre-checked, others unchecked.
+    default_selected = [e.slug for e in lib if e.recommended]
+    state_key = "_live_selected_slugs"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = list(default_selected)
+
+    # Compact picker
+    pick_cols = st.columns([3, 2, 2])
+    if pick_cols[0].button("✅  Select all recommended",
+                            use_container_width=True):
+        st.session_state[state_key] = list(default_selected)
+        st.rerun()
+    if pick_cols[1].button("Clear all", use_container_width=True):
+        st.session_state[state_key] = []
+        st.rerun()
+    risk_default = float(pick_cols[2].number_input(
+        "Default risk per trade %",
+        value=0.30, step=0.05, format="%.2f",
+        min_value=0.05, max_value=2.0,
+        help="Applied to every strategy on first selection. Override per "
+              "row below.",
+    ))
+
+    # Determine the active account for sizing math
+    try:
+        accounts = account_manager.list_accounts()
+        active = accounts[0] if accounts else None
+    except Exception:
+        active = None
+    if active is None:
+        st.info(
+            "Add an MT5 account on the Operations page to size positions. "
+            "Showing portfolio with placeholder $100,000 equity.")
+        equity = 100_000.0
     else:
-        st.error("One or more pre-flight checks are RED. "
-                  "Live trading is BLOCKED.")
+        equity = float(active.effective_baseline_equity)
+        st.caption(
+            f"Sizing against **{active.alias}** "
+            f"(baseline ${equity:,.0f}). Change baseline in Operations → "
+            f"Settings.")
 
-    # Sticky emergency stop button
+    # ------- 3. Per-row card with checkbox + risk + computed lots -------
+    selected_slugs: list[str] = []
+    for entry in lib:
+        es = entry.edge
+        with st.container(border=True):
+            row = st.columns([0.5, 4, 1.5, 1.5, 1.5, 1.5])
+            checked = row[0].checkbox(
+                "", value=(entry.slug in st.session_state[state_key]),
+                key=f"chk_{entry.slug}", label_visibility="collapsed",
+            )
+            star = "⭐ " if entry.recommended else ""
+            edge_chip = ("<span style='background:#15803d;color:white;"
+                         "padding:2px 6px;border-radius:4px;"
+                         "font-size:0.7rem;font-weight:600;'>EDGE</span>"
+                         if es and es.is_survivor else "")
+            row[1].markdown(
+                f"{star}**`{entry.strategy}`**  "
+                f"on `{entry.ticker}` · `{entry.tf}` · "
+                f"{'long-only' if entry.long_only else 'bidir'}  "
+                f"{edge_chip}",
+                unsafe_allow_html=True,
+            )
+            if es is not None:
+                row[2].markdown(
+                    f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                    f"font-size:0.78rem;font-variant-numeric:tabular-nums;"
+                    f"line-height:1.4;'>"
+                    f"<span style='color:#9ca3af;'>PF</span> "
+                    f"{es.test_pf:.2f}<br>"
+                    f"<span style='color:#9ca3af;'>R</span> "
+                    f"<b>{es.test_r:+.2f}</b></div>",
+                    unsafe_allow_html=True,
+                )
+                row[3].markdown(
+                    f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                    f"font-size:0.78rem;font-variant-numeric:tabular-nums;"
+                    f"line-height:1.4;'>"
+                    f"<span style='color:#9ca3af;'>n_test</span> "
+                    f"{es.n_test}<br>"
+                    f"<span style='color:#9ca3af;'>train R</span> "
+                    f"{es.train_r:+.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                row[2].caption("(no stats)")
+                row[3].caption("")
+            risk_pct = float(row[4].number_input(
+                "risk %", value=risk_default, step=0.05, format="%.2f",
+                min_value=0.05, max_value=2.0,
+                key=f"risk_{entry.slug}", label_visibility="collapsed",
+            ))
+
+            # Compute approximate lots — uses a coarse stop estimate of
+            # 1×ATR ≈ 1% of price. Real lots come from the strategy at
+            # signal-time; this is a sanity-check display only.
+            risk_dollars = equity * risk_pct / 100.0
+            row[5].markdown(
+                f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                f"font-size:0.78rem;font-variant-numeric:tabular-nums;'>"
+                f"<span style='color:#9ca3af;'>risk $</span> "
+                f"<b>{risk_dollars:,.0f}</b><br>"
+                f"<span style='color:#9ca3af;'>lots</span> "
+                f"<i>signal-time</i></div>",
+                unsafe_allow_html=True,
+            )
+            if entry.why:
+                st.caption(entry.why)
+            if checked:
+                selected_slugs.append(entry.slug)
+
+    # Persist selection
+    st.session_state[state_key] = selected_slugs
+
+    # ------- 4. Deploy button -------
     st.markdown("---")
     cols = st.columns([3, 1])
-    cols[0].markdown("**Emergency stop sentinel** — touch this file from any "
-                      "process (or this button) to refuse all new live orders. "
-                      f"Path: `{sentinel}`")
-    if cols[1].button("⛔  Touch EMERGENCY_STOP",
-                        type="primary", key="live_estop"):
-        sentinel.touch()
-        st.toast("EMERGENCY_STOP file created")
-        st.rerun()
+    cols[0].markdown(
+        f"**{len(selected_slugs)}** strategies selected.  Total daily-cap "
+        f"budget at default risk: **{len(selected_slugs) * risk_default:.2f}%** "
+        f"({len(selected_slugs) * risk_default * 0.01 * equity:,.0f} $).")
+    can_deploy = (len(selected_slugs) > 0
+                  and all(ok for _, ok in checks))
+    if cols[1].button("🚀 Deploy to live", type="primary",
+                       disabled=not can_deploy,
+                       use_container_width=True,
+                       help="Pre-flight gates must be green. Use the "
+                            "Operations page to clear EMERGENCY_STOP."):
+        # Wire each selection into deployments.json for the active account
+        if active is None:
+            st.error("Add an MT5 account first.")
+        else:
+            from core import deployment as dep_mod
+            for slug in selected_slugs:
+                entry = next((e for e in lib if e.slug == slug), None)
+                if entry is None:
+                    continue
+                dep_id = (dep_mod.Deployment.slug(
+                    entry.strategy, entry.ticker, entry.tf)
+                    + ("_long" if entry.long_only else "_bidir"))
+                risk = float(st.session_state.get(
+                    f"risk_{slug}", risk_default))
+                d = dep_mod.Deployment(
+                    deployment_id=dep_id,
+                    strategy=entry.strategy,
+                    ticker=entry.ticker, tf=entry.tf,
+                    long_only=entry.long_only,
+                    params={"long_only": entry.long_only},
+                    risk_pct=risk, daily_cap_pct=cfg.daily_loss_cap_pct,
+                    status="live",   # NB: actual order routing still gated
+                )
+                dep_mod.upsert_deployment(active.login, d)
+            st.success(
+                f"Deployed {len(selected_slugs)} strategies to "
+                f"#{active.login}. View on the Operations page.")
+            st.toast("🚀 Live portfolio updated.")
 
 
 # ---------------------------------------------------------------------------

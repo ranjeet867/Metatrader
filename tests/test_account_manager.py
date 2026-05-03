@@ -34,14 +34,14 @@ def test_empty_registry_returns_empty_list():
 
 def test_add_account_creates_dir_tree():
     a = account_manager.add_account(
-        login=5031019095, alias="FTMO 100k Challenge",
+        login=1234567890, alias="FTMO 100k Challenge",
         broker="FTMO", type="challenge_100k", ftmo_phase=1,
         user_tz="Asia/Kolkata",
     )
-    assert a.login == 5031019095
+    assert a.login == 1234567890
     assert a.is_ftmo
     # Directory created
-    assert account_manager.account_dir(5031019095).exists()
+    assert account_manager.account_dir(1234567890).exists()
 
 
 def test_add_idempotent_on_login():

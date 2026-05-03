@@ -122,6 +122,21 @@ ftmo-sim:
 dashboard:
 	$(VENV)/bin/streamlit run dashboards/app.py --server.port 8502
 
+# Kill any process bound to the dashboard port and re-launch. Useful after
+# config / component changes that Streamlit's hot-reload can't pick up
+# (e.g. new component files added to dashboards/components/).
+# Usage:  make restart-dashboard
+restart-dashboard:
+	@echo "→ killing any process listening on :8502 …"
+	-@lsof -ti tcp:8502 | xargs -r kill -9 2>/dev/null || true
+	-@pkill -f "streamlit run dashboards/app.py" 2>/dev/null || true
+	@sleep 1
+	@echo "→ relaunching dashboard …"
+	@$(VENV)/bin/streamlit run dashboards/app.py --server.port 8502 \
+	  > /tmp/v2_dashboard.log 2>&1 &
+	@sleep 2
+	@echo "→ dashboard restarted at http://localhost:8502 (logs: /tmp/v2_dashboard.log)"
+
 # Legacy single-page dashboard (control.py) — kept for reference; new work
 # goes through `make dashboard`.
 dashboard-legacy:

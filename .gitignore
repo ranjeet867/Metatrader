@@ -1,9 +1,53 @@
-__pycache__/
-*.pyc
+# ─── Personal account / broker data ────────────────────────────────────────
+# Anything under data/ that contains broker creds, account IDs, or trade
+# history must NOT leak. The defaults here keep the structure but strip
+# the contents.
+data/accounts.json
+data/accounts/
+data/v2.db
+data/v2.db-*
+data/EMERGENCY_STOP
+data/risk_config.json
+data/symbol_info.json
+
+# ─── Cached broker price data — large + replaceable ───────────────────────
+data/*.parquet
+data/candles/
+
+# ─── MT5 Strategy Tester reports (broker-account specific) ─────────────────
+data/mt5_tester_reports/
+
+# ─── Generated docs (sweep / optimization output is huge + per-machine) ─
+docs/grid_results.md
+docs/optimization_*.md
+docs/parity_*.md
+docs/*_screening.md
+
+# ─── Python ─────────────────────────────────────────────────────────────────
 .venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
-*.egg-info/
+.mypy_cache/
 .coverage
+.coverage.*
 htmlcov/
-data/v2.db
+*.egg
+
+# ─── IDE / OS ──────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ─── Streamlit ─────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+/tmp/v2_dashboard.log
+*.log

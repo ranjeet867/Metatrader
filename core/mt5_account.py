@@ -29,6 +29,19 @@ class AccountInfo:
     equity: float
     currency: str
     leverage: int
+    # New (Phase 2.5): broker context. Older bridges that don't return these
+    # leave them empty/0 — every consumer handles the empty case.
+    name: str = ""              # account holder
+    server: str = ""            # broker server, e.g. "FTMO-Demo", "FTMO-Server2"
+    company: str = ""           # broker company, e.g. "FTMO Trader s.r.o."
+    trade_mode: int = 0         # MT5: 0=DEMO, 1=CONTEST, 2=REAL
+    margin: float = 0.0
+    margin_free: float = 0.0
+    margin_level: float = 0.0
+
+    @property
+    def trade_mode_label(self) -> str:
+        return {0: "demo", 1: "contest", 2: "real"}.get(self.trade_mode, "demo")
 
 
 @dataclass
@@ -168,6 +181,13 @@ class MT5AccountClient:
             equity=float(data.get("equity", 0.0)),
             currency=str(data.get("currency", "USD")),
             leverage=int(data.get("leverage", 1)),
+            name=str(data.get("name", "")),
+            server=str(data.get("server", "")),
+            company=str(data.get("company", "")),
+            trade_mode=int(data.get("trade_mode", 0) or 0),
+            margin=float(data.get("margin", 0.0)),
+            margin_free=float(data.get("margin_free", 0.0)),
+            margin_level=float(data.get("margin_level", 0.0)),
         )
         self._account_cache = (now, ai)
         return ai

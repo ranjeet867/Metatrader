@@ -4,9 +4,7 @@ time-guard countdowns, EMERGENCY STOP, FTMO pass-rate gauge (placeholder).
 """
 from __future__ import annotations
 
-import json
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -18,15 +16,12 @@ if str(REPO) not in sys.path:
 
 from core import storage   # noqa: E402
 from core.config import (   # noqa: E402
-    DEFAULT_CONFIG,
-    default_config_dict,
     load_config,
     save_config,
 )
 from core.risk_engine import LiveRiskTracker   # noqa: E402
 from core.time_guards import time_guard_cfg_from_risk_config   # noqa: E402
 from dashboards.components.mt5_status import (   # noqa: E402
-    render_account_card,
     render_emergency_stop_indicator,
 )
 from dashboards.components.time_guard_status import render_countdowns   # noqa: E402
@@ -233,73 +228,165 @@ def render_risk_caps_editor(cfg):
 
 
 def render_ftmo_pass_rate_widget():
-    """Phase 25: Monte-Carlo bootstrap pass-rate. Uses the SAME
-    core/ftmo_simulator.py code as `make ftmo-sim`."""
+    """Monte-Carlo bootstrap pass-rate driven by the Strategy Library.
+
+    Pick which strategies to include from the recommended portfolio,
+    set iterations + days + pass target, click Run. Each pick's
+    OOS R-distribution is bootstrapped on the fly from real broker data.
+    """
     import numpy as np
 
+    from core import strategy_library
+    from core.backtest import run_backtest
+    from core.data import load_parquet
     from core.ftmo_simulator import StrategyDist, simulate_pass_rate
+    from dashboards.components.state import discover_strategies
 
     st.markdown("### 🎲  FTMO Pass-Rate Simulator")
     st.caption(
-        "Monte-Carlo bootstrap from each strategy's OOS R-distribution. "
-        "Same code as `make ftmo-sim`."
+        "Pick which strategies to include in your simulated FTMO portfolio. "
+        "Defaults to the ⭐ recommended ones from the Strategy Library.")
+
+    lib = strategy_library.list_library()
+    if not lib:
+        st.warning(
+            "Strategy Library is empty — run `make sweep-grid` to "
+            "populate it.")
+        return
+
+    label_for: dict[str, strategy_library.LibraryEntry] = {
+        f"{e.strategy} · {e.ticker} · {e.tf}"
+        + (" ⭐" if e.recommended else "")
+        + (" · ✅" if e.has_edge else ""):
+        e for e in lib
+    }
+    default_picks = [k for k, e in label_for.items() if e.recommended]
+
+    picks = st.multiselect(
+        "Strategies to include",
+        options=list(label_for.keys()),
+        default=default_picks,
+        key="ftmo_lib_picks",
     )
 
-    cols = st.columns([1, 1, 1, 1])
+    cols = st.columns([1, 1, 1, 1, 1])
     n_iter = int(cols[0].number_input("iterations", value=5_000, step=1000,
                                           min_value=500, max_value=50_000,
                                           key="ftmo_n"))
     days = int(cols[1].number_input("days", value=30, step=5,
-                                        min_value=5, max_value=90, key="ftmo_d"))
-    target = float(cols[2].number_input("pass target %", value=10.0, step=1.0,
-                                           min_value=1.0, max_value=20.0,
+                                       min_value=5, max_value=90, key="ftmo_d"))
+    target = float(cols[2].number_input("pass target %", value=10.0,
+                                           step=1.0, min_value=1.0, max_value=20.0,
                                            key="ftmo_t"))
-    seed = int(cols[3].number_input("seed", value=42, step=1, key="ftmo_seed"))
+    risk = float(cols[3].number_input("risk %/trade", value=0.5, step=0.05,
+                                        min_value=0.05, max_value=2.0,
+                                        format="%.2f", key="ftmo_risk"))
+    seed = int(cols[4].number_input("seed", value=42, step=1,
+                                       key="ftmo_seed"))
 
-    if not st.button("🎲  Recompute pass probability", type="primary",
+    if not st.button("🎲  Run simulation", type="primary",
                        key="ftmo_run"):
-        st.info("Click to run. Uses the survivor portfolio from "
-                 "docs/index_edge_findings.md by default.")
+        st.info("Pick strategies above and click Run.")
         return
 
-    # Bootstrap pools from cached parquets — same as scripts/ftmo_sim.py
-    from core.backtest import partition_train_test, run_backtest
-    from core.data import load_parquet
-    from strategies.vol_breakout import VolBreakout, VolBreakoutParams
+    if not picks:
+        st.error("Pick at least one strategy.")
+        return
 
-    SURVIVORS = [
-        ("US100.cash", "D1", 1.0,   6.5,  0.18),
-        ("GER40.cash", "D1", 1.0,   3.0,  0.20),
-        ("USDJPY",      "D1", 700.0, 1.0,  0.18),
-    ]
-    pool = []
-    rep_root = REPO
-    for sym, tf, mpu, lots, tpd in SURVIVORS:
-        path = rep_root / "data" / f"{sym}_{tf}.parquet"
-        if not path.exists():
-            continue
-        df = load_parquet(path)
-        strat = VolBreakout(VolBreakoutParams(long_only=True))
-        r = run_backtest(
-            df, strat.signals(df),
-            starting_balance=100_000, lots=lots, money_per_unit_price=mpu,
-            commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
-            symbol=sym,
-            enforce_weekend_flat=True, enforce_daily_flat=True,
-        )
-        split = int(len(df) * 0.6)
-        rs = np.array([t.r_multiple for t in r.trades
-                         if t.entry_bar_idx >= split], dtype=float)
-        if rs.size > 0:
+    # Build StrategyDist for each pick by re-running the backtest on the
+    # cached parquet and slicing the OOS portion (60/40 split).
+    strats_by_name = discover_strategies()
+    pool: list[StrategyDist] = []
+    debug_rows = []
+    small_sample_warns: list[str] = []
+    bars_per_day = {"M15": 96, "H1": 24, "H4": 6, "D1": 1}
+    with st.spinner(f"Bootstrapping {len(picks)} strategy pools…"):
+        for label in picks:
+            entry = label_for[label]
+            # Strip variant suffix (e.g. ema_cross_9_20 → ema_cross)
+            base = entry.strategy
+            for needle in ("_9_20", "_12_26", "_20_50", "_30_70",
+                            "_20", "_55", "_20_2", "_10"):
+                if base.endswith(needle):
+                    base = base[: -len(needle)]
+                    break
+            if base not in strats_by_name:
+                debug_rows.append((label, "strategy class not found"))
+                continue
+            StratCls, ParamsCls = strats_by_name[base]
+            ppath = REPO / "data" / f"{entry.ticker}_{entry.tf}.parquet"
+            if not ppath.exists():
+                debug_rows.append((label, "parquet missing"))
+                continue
+            try:
+                df = load_parquet(ppath)
+                if ParamsCls is not None:
+                    strat = StratCls(ParamsCls(long_only=entry.long_only))
+                else:
+                    strat = StratCls()
+                r = run_backtest(
+                    df, strat.signals(df),
+                    starting_balance=100_000,
+                    lots=1.0, money_per_unit_price=1.0,
+                    commission_per_trade=3.0,
+                    slippage_per_fill_atr_frac=0.1,
+                    symbol=entry.ticker,
+                )
+            except Exception as e:
+                debug_rows.append((label, f"backtest failed: {e}"))
+                continue
+            split = int(len(df) * 0.6)
+            rs = np.array([t.r_multiple for t in r.trades
+                            if t.entry_bar_idx >= split], dtype=float)
+            if rs.size == 0:
+                debug_rows.append((label, "no OOS trades"))
+                continue
+            # FIX: trades_per_DAY (not per BAR). Earlier version divided
+            # by oos_bars which makes M15 trades_per_day ~96× too small,
+            # giving sims 0 trades on most days; D1 strategies were OK
+            # but the formula was still semantically wrong.
+            bpd = bars_per_day.get(entry.tf, 1)
+            n_oos_days = max(1.0, (len(df) - split) / bpd)
+            tp_day = max(0.05, len(rs) / n_oos_days)
+
+            if rs.size < 15:
+                small_sample_warns.append(
+                    f"`{label}` has only {rs.size} OOS trades — "
+                    "bootstrap tails are unreliable. "
+                    "Consider deselecting or lowering risk %.")
+
             pool.append(StrategyDist(
-                name=f"vol_breakout_{sym}_{tf}", symbol=sym,
-                r_multiples=rs, trades_per_day=tpd, risk_per_trade_pct=1.0,
+                name=label,
+                symbol=entry.ticker,
+                r_multiples=rs,
+                trades_per_day=tp_day,
+                risk_per_trade_pct=risk,
             ))
+
+    if small_sample_warns:
+        with st.expander(
+                f"⚠ {len(small_sample_warns)} small-sample warning(s)",
+                expanded=True):
+            for w in small_sample_warns:
+                st.markdown(f"- {w}")
+            st.caption(
+                "Bootstrap simulations from <15 OOS trades are dominated "
+                "by individual extreme draws. The shown P(pass) and "
+                "E[final %] reflect that uncertainty — they are not "
+                "predictions, they are stress tests.")
+
+    if debug_rows:
+        with st.expander(
+            f"⚠ {len(debug_rows)} pick(s) excluded — see why"):
+            for label, why in debug_rows:
+                st.markdown(f"- `{label}` — {why}")
+
     if not pool:
-        st.error("No data — couldn't build the bootstrap pool.")
+        st.error("No usable strategies — see exclusions above.")
         return
 
-    with st.spinner(f"Running {n_iter:,} iterations..."):
+    with st.spinner(f"Running {n_iter:,} iterations on {len(pool)} "
+                     f"strategies…"):
         res = simulate_pass_rate(
             pool, starting_balance=100_000,
             days=days, daily_loss_cap_pct=5.0, total_loss_cap_pct=10.0,
@@ -321,8 +408,7 @@ def render_ftmo_pass_rate_widget():
             "contrib_dd_%": round(res.contrib_dd_per_strategy.get(name, 0), 2),
         })
     contrib_df = pd.DataFrame(contrib_rows).sort_values(
-        "contrib_return_%", ascending=False
-    )
+        "contrib_return_%", ascending=False)
     st.dataframe(contrib_df, use_container_width=True)
 
 

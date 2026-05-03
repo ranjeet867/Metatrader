@@ -98,33 +98,68 @@ def update_status(login: int, deployment_id: str, status: DeploymentStatus,
 
 
 def seed_survivor_deployments(login: int) -> list[Deployment]:
-    """Pre-fill an account with the 6 vol_breakout survivors documented in
-    docs/index_edge_findings.md. Idempotent — re-running adds nothing new."""
-    survivors = [
-        ("US100.cash", "D1", True),
-        ("GER40.cash", "D1", True),
-        ("USDJPY",      "D1", True),
-        ("EU50.cash",  "H1", False),
-        ("US100.cash", "H1", False),
-        ("US100.cash", "D1", False),
-    ]
+    """Pre-fill an account with the recommended portfolio from
+    `core.strategy_library` — the survivors backed by real grid stats.
+    Idempotent — re-running adds nothing new.
+
+    Falls back to the static list below if the library is empty (no
+    grid_results.md). The fallback uses ema_cross + donchian on the
+    proven D1 cells.
+    """
+    try:
+        from core import strategy_library
+        lib = [e for e in strategy_library.list_library() if e.recommended]
+    except Exception:
+        lib = []
+
     existing = {d.deployment_id for d in load_deployments(login)}
-    deps = []
-    for ticker, tf, long_only in survivors:
-        slug = Deployment.slug("vol_breakout", ticker, tf)
-        # Distinguish long-only vs bidir by suffix in the slug
-        slug = slug + ("_long" if long_only else "_bidir")
-        if slug in existing:
-            continue
-        deps.append(Deployment(
-            deployment_id=slug,
-            strategy="vol_breakout",
-            ticker=ticker, tf=tf,
-            long_only=long_only,
-            params={"long_only": long_only},
-            risk_pct=0.3, daily_cap_pct=1.0,
-            status="idle",
-        ))
+    deps: list[Deployment] = []
+
+    if lib:
+        for entry in lib:
+            slug = (Deployment.slug(entry.strategy, entry.ticker, entry.tf)
+                    + ("_long" if entry.long_only else "_bidir"))
+            if slug in existing:
+                continue
+            # Pre-fill params with long_only and any other params the
+            # strategy supports (parsed from the variant suffix).
+            params: dict[str, Any] = {"long_only": entry.long_only}
+            deps.append(Deployment(
+                deployment_id=slug,
+                strategy=entry.strategy,
+                ticker=entry.ticker, tf=entry.tf,
+                long_only=entry.long_only,
+                params=params,
+                risk_pct=0.3, daily_cap_pct=1.0,
+                status="idle",
+                notes=entry.why or "",
+            ))
+    else:
+        # Static fallback — exact strategy names with their params.
+        # Each row: (strategy, ticker, tf, long_only, why)
+        fallback = [
+            ("ema_cross_9_20",  "USDJPY",     "D1", True,
+             "Strongest test_R survivor on D1 cross-pair."),
+            ("ema_cross_12_26", "GBPJPY",     "D1", True,
+             "Second-strongest D1 cross-pair."),
+            ("ema_cross_9_20",  "GBPUSD",     "D1", True,
+             "Cleanest D1 cross — 13 OOS trades."),
+            ("donchian_20",     "US100.cash", "D1", True,
+             "Index breakout — 19 OOS trades."),
+        ]
+        for strategy, ticker, tf, long_only, why in fallback:
+            slug = (Deployment.slug(strategy, ticker, tf)
+                    + ("_long" if long_only else "_bidir"))
+            if slug in existing:
+                continue
+            deps.append(Deployment(
+                deployment_id=slug, strategy=strategy,
+                ticker=ticker, tf=tf, long_only=long_only,
+                params={"long_only": long_only},
+                risk_pct=0.3, daily_cap_pct=1.0,
+                status="idle", notes=why,
+            ))
+
     if deps:
         merged = load_deployments(login) + deps
         save_deployments(login, merged)

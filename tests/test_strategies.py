@@ -22,6 +22,7 @@ from strategies.donchian_breakout import DonchianBreakout, DonchianBreakoutParam
 from strategies.rsi_meanrev import RsiMeanRev, RsiMeanRevParams
 from strategies.bbands_meanrev import BBandsMeanRev, BBandsMeanRevParams
 from strategies.ibs import Ibs, IbsParams
+from strategies.orb import Orb, OrbParams
 from strategies.overnight_drift import OvernightDrift, OvernightDriftParams
 from tests.fixtures.synthetic import constant, linear_ramp, sawtooth, step_function
 
@@ -33,7 +34,51 @@ ALL_STRATEGIES = [
     ("bbands_meanrev",     lambda: BBandsMeanRev(BBandsMeanRevParams())),
     ("ibs",                lambda: Ibs(IbsParams())),
     ("overnight_drift",    lambda: OvernightDrift(OvernightDriftParams())),
+    ("orb",                lambda: Orb(OrbParams())),
 ]
+
+
+def _m15_session_candles(n_sessions: int = 3, breakout_above: bool = True,
+                          start_date: str = "2024-01-02") -> pd.DataFrame:
+    """Build M15 candles spanning n_sessions US sessions (13:30 → 19:45 UTC).
+
+    Session structure:
+      bar 0..3 (13:30, 13:45, 14:00, 14:15) — OR forms.
+      bar 4 (14:30)                        — breakout bar.
+      bars 5..25 (14:45..19:45)            — drift toward target.
+      bar 26 (20:00)                       — session close (NOT included).
+
+    With breakout_above=True the breakout bar's close is well above OR_high.
+    With breakout_above=False the breakout bar's close is well below OR_low.
+    """
+    bars_per_session = 26   # 13:30 .. 19:45 inclusive
+    rows = []
+    base_price = 100.0
+    for d in range(n_sessions):
+        date = pd.Timestamp(start_date, tz="UTC") + pd.Timedelta(days=d)
+        for i in range(bars_per_session):
+            t = date + pd.Timedelta(hours=13, minutes=30) + pd.Timedelta(minutes=15 * i)
+            # Default close = base_price + small noise per bar within the OR window
+            if i < 4:
+                close = base_price + (i * 0.05)   # drift slightly within OR
+            elif i == 4:
+                # Breakout bar: cleanly above (or below) OR
+                close = base_price + (1.0 if breakout_above else -1.0)
+            else:
+                # Drift toward the breakout direction (give target a chance)
+                close = base_price + ((i - 3) * (0.05 if breakout_above else -0.05))
+            rng = 0.10
+            row = {
+                "time": t,
+                "open": close,
+                "high": close + rng,
+                "low": close - rng,
+                "close": close,
+                "volume": 1000.0,
+            }
+            rows.append(row)
+        base_price += 0.5  # tiny day-on-day drift so sessions aren't identical
+    return pd.DataFrame(rows)
 
 
 # ===========================================================================
@@ -226,6 +271,65 @@ class TestOvernightDriftStrategy:
         sigs = OvernightDrift(OvernightDriftParams()).signals(df)
         last = len(df) - 1
         assert not any(s.bar_idx == last for s in sigs)
+
+
+# ===========================================================================
+# ORB strategy — specific tests
+# ===========================================================================
+class TestOrbStrategy:
+    def test_no_signals_on_hourly_data(self):
+        """If no bar lands at session_open time, ORB never fires."""
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=10, down_bars=10, n_cycles=5)
+        sigs = Orb(OrbParams()).signals(df)
+        assert sigs == []
+
+    def test_long_breakout_fires_at_or_breakout_bar(self):
+        df = _m15_session_candles(n_sessions=2, breakout_above=True)
+        sigs = Orb(OrbParams()).signals(df)
+        assert len(sigs) >= 1
+        # First session: bars 0..25; breakout bar = bar 4 (14:30 UTC)
+        first = sigs[0]
+        assert first.bar_idx == 4
+        assert first.direction == "LONG"
+        # Stop = OR_low; entry > stop
+        assert first.stop_price < first.entry_price < first.target_price
+
+    def test_short_breakout_fires_when_close_below_or_low(self):
+        df = _m15_session_candles(n_sessions=2, breakout_above=False)
+        sigs = Orb(OrbParams()).signals(df)
+        assert len(sigs) >= 1
+        assert sigs[0].direction == "SHORT"
+        assert sigs[0].target_price < sigs[0].entry_price < sigs[0].stop_price
+
+    def test_long_only_skips_short_breakouts(self):
+        df = _m15_session_candles(n_sessions=2, breakout_above=False)
+        sigs = Orb(OrbParams(long_only=True)).signals(df)
+        # No long breakouts in this fixture, so we expect zero signals
+        assert all(s.direction == "LONG" for s in sigs)
+
+    def test_at_most_one_signal_per_session(self):
+        df = _m15_session_candles(n_sessions=3, breakout_above=True)
+        sigs = Orb(OrbParams()).signals(df)
+        # 3 sessions, ≤ 1 signal each
+        assert len(sigs) <= 3
+
+    def test_max_hold_bars_within_session(self):
+        df = _m15_session_candles(n_sessions=2, breakout_above=True)
+        sigs = Orb(OrbParams()).signals(df)
+        bars_per_session = 26
+        for s in sigs:
+            session_start_bar = (s.bar_idx // bars_per_session) * bars_per_session
+            last_session_bar = session_start_bar + bars_per_session - 1
+            assert s.bar_idx + s.max_hold_bars <= last_session_bar
+
+    def test_geometry_valid_on_real_breakouts(self):
+        df = _m15_session_candles(n_sessions=4, breakout_above=True)
+        for s in Orb(OrbParams()).signals(df):
+            if s.direction == "LONG":
+                assert s.stop_price < s.entry_price < s.target_price
+            else:
+                assert s.target_price < s.entry_price < s.stop_price
 
 
 # ===========================================================================

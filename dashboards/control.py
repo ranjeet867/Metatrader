@@ -873,6 +873,12 @@ def main() -> None:
     st.set_page_config(page_title="v2 Quant Control", layout="wide",
                         initial_sidebar_state="expanded")
     st.title("📈  mt5_quant_trader_v2 — Control Dashboard")
+    st.warning(
+        "⚠️  **This is the legacy single-page dashboard.** New work should use "
+        "the multi-page app — run `make dashboard` to start it on port 8502, "
+        "or `make dashboard-legacy` to keep using this page.",
+        icon="⚠️",
+    )
     st.caption(
         "Every result on this page goes through `core.backtest.run_backtest` — "
         "the same reconciliation-enforced engine the test suite verifies. "

@@ -104,8 +104,14 @@ sweep-grid:
 	  --train-pct $(or $(TRAIN),0.6) \
 	  $(if $(LONGONLY),--long-only,)
 
-# Streamlit control dashboard (Backtest / Refresh / Sweep / Paper-stub)
+# Streamlit multi-page dashboard. Port 8502 to avoid clashing with v1's :8501.
+# Pages are auto-discovered from dashboards/pages/.
 dashboard:
+	$(VENV)/bin/streamlit run dashboards/app.py --server.port 8502
+
+# Legacy single-page dashboard (control.py) — kept for reference; new work
+# goes through `make dashboard`.
+dashboard-legacy:
 	$(VENV)/bin/streamlit run dashboards/control.py
 
 clean:

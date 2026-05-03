@@ -104,6 +104,19 @@ sweep-grid:
 	  --train-pct $(or $(TRAIN),0.6) \
 	  $(if $(LONGONLY),--long-only,)
 
+# Vet a strategy in <60s — verifies invariants + 8×3 grid + verdict.
+# Generates docs/<name>_screening.md.
+# Usage: make screen STRATEGY=ibs
+#        make screen STRATEGY=vol_breakout TICKER=US100.cash TF=D1
+screen:
+	$(PYBIN) scripts/screen_strategy.py --strategy $(STRATEGY) \
+	  $(if $(TICKER),--ticker $(TICKER),) \
+	  $(if $(TF),--tf $(TF),)
+
+# Run the FTMO pass-rate Monte-Carlo simulator on the current portfolio.
+ftmo-sim:
+	$(PYBIN) scripts/ftmo_sim.py $(ARGS)
+
 # Streamlit multi-page dashboard. Port 8502 to avoid clashing with v1's :8501.
 # Pages are auto-discovered from dashboards/pages/.
 dashboard:

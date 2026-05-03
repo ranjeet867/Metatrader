@@ -168,19 +168,97 @@ def render_risk_caps_editor(cfg):
 
 
 def render_ftmo_pass_rate_widget():
-    """Placeholder for the Phase 25 simulator. We render the panel so the
-    structure is present; the real Monte-Carlo will land in core/ftmo_simulator.py.
-    """
-    st.markdown("### 🎲  FTMO Pass-Rate Simulator (preview)")
-    cols = st.columns([1, 2])
-    cols[0].metric("P(pass in 30 days)", "—",
-                    help="Coming in Phase 25 — `make ftmo-sim`")
-    cols[1].caption(
+    """Phase 25: Monte-Carlo bootstrap pass-rate. Uses the SAME
+    core/ftmo_simulator.py code as `make ftmo-sim`."""
+    import numpy as np
+
+    from core.ftmo_simulator import StrategyDist, simulate_pass_rate
+
+    st.markdown("### 🎲  FTMO Pass-Rate Simulator")
+    st.caption(
         "Monte-Carlo bootstrap from each strategy's OOS R-distribution. "
-        "Implementation lives in `core/ftmo_simulator.py` (next milestone). "
-        "Until then, run a single backtest of your portfolio per-strategy "
-        "and inspect the R-distribution histogram on Page 4."
+        "Same code as `make ftmo-sim`."
     )
+
+    cols = st.columns([1, 1, 1, 1])
+    n_iter = int(cols[0].number_input("iterations", value=5_000, step=1000,
+                                          min_value=500, max_value=50_000,
+                                          key="ftmo_n"))
+    days = int(cols[1].number_input("days", value=30, step=5,
+                                        min_value=5, max_value=90, key="ftmo_d"))
+    target = float(cols[2].number_input("pass target %", value=10.0, step=1.0,
+                                           min_value=1.0, max_value=20.0,
+                                           key="ftmo_t"))
+    seed = int(cols[3].number_input("seed", value=42, step=1, key="ftmo_seed"))
+
+    if not st.button("🎲  Recompute pass probability", type="primary",
+                       key="ftmo_run"):
+        st.info("Click to run. Uses the survivor portfolio from "
+                 "docs/index_edge_findings.md by default.")
+        return
+
+    # Bootstrap pools from cached parquets — same as scripts/ftmo_sim.py
+    from core.backtest import partition_train_test, run_backtest
+    from core.data import load_parquet
+    from strategies.vol_breakout import VolBreakout, VolBreakoutParams
+
+    SURVIVORS = [
+        ("US100.cash", "D1", 1.0,   6.5,  0.18),
+        ("GER40.cash", "D1", 1.0,   3.0,  0.20),
+        ("USDJPY",      "D1", 700.0, 1.0,  0.18),
+    ]
+    pool = []
+    rep_root = REPO
+    for sym, tf, mpu, lots, tpd in SURVIVORS:
+        path = rep_root / "data" / f"{sym}_{tf}.parquet"
+        if not path.exists():
+            continue
+        df = load_parquet(path)
+        strat = VolBreakout(VolBreakoutParams(long_only=True))
+        r = run_backtest(
+            df, strat.signals(df),
+            starting_balance=100_000, lots=lots, money_per_unit_price=mpu,
+            commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+            symbol=sym,
+            enforce_weekend_flat=True, enforce_daily_flat=True,
+        )
+        split = int(len(df) * 0.6)
+        rs = np.array([t.r_multiple for t in r.trades
+                         if t.entry_bar_idx >= split], dtype=float)
+        if rs.size > 0:
+            pool.append(StrategyDist(
+                name=f"vol_breakout_{sym}_{tf}", symbol=sym,
+                r_multiples=rs, trades_per_day=tpd, risk_per_trade_pct=1.0,
+            ))
+    if not pool:
+        st.error("No data — couldn't build the bootstrap pool.")
+        return
+
+    with st.spinner(f"Running {n_iter:,} iterations..."):
+        res = simulate_pass_rate(
+            pool, starting_balance=100_000,
+            days=days, daily_loss_cap_pct=5.0, total_loss_cap_pct=10.0,
+            pass_target_pct=target, n_iterations=n_iter, seed=seed,
+        )
+
+    cols = st.columns(4)
+    cols[0].metric("P(pass)", f"{res.p_pass*100:.1f}%")
+    cols[1].metric("P(daily breach)", f"{res.p_daily_breach*100:.1f}%")
+    cols[2].metric("P(total breach)", f"{res.p_total_breach*100:.1f}%")
+    cols[3].metric("E[final %]", f"{res.expected_final_pct:+.2f}%")
+
+    st.markdown("**Per-strategy contribution** (mean across all iterations)")
+    contrib_rows = []
+    for name, ret in res.contrib_R_per_strategy.items():
+        contrib_rows.append({
+            "strategy": name,
+            "contrib_return_%": round(ret, 2),
+            "contrib_dd_%": round(res.contrib_dd_per_strategy.get(name, 0), 2),
+        })
+    contrib_df = pd.DataFrame(contrib_rows).sort_values(
+        "contrib_return_%", ascending=False
+    )
+    st.dataframe(contrib_df, use_container_width=True)
 
 
 def main():

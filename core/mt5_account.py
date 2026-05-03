@@ -15,6 +15,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -38,6 +39,66 @@ class SymbolInfo:
     volume_step: float
     volume_min: float
     contract_size: float
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: live position + history shapes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BridgePosition:
+    """Wire shape for a position fetched from the MT5 bridge.
+    Fields match what MT5 SymbolInfoXxx returns (subset).
+    """
+    ticket: int
+    symbol: str
+    type: int                         # 0=BUY, 1=SELL (MT5 convention)
+    volume: float
+    price_open: float
+    sl: float
+    tp: float
+    price_current: float
+    profit: float
+    swap: float
+    commission: float
+    time_open_utc: str
+    magic: int
+    comment: str
+
+
+@dataclass
+class BridgeDeal:
+    """One historical deal — what came back from history_deals_get."""
+    ticket: int
+    order: int
+    position_id: int
+    time_utc: str
+    type: int
+    entry: int                        # 0=in, 1=out, etc.
+    symbol: str
+    volume: float
+    price: float
+    profit: float
+    swap: float
+    commission: float
+    comment: str
+
+
+@dataclass
+class CloseOrderResult:
+    ok: bool
+    retcode: int
+    deal: int
+    price: float
+    comment: str
+
+
+class BridgeError(RuntimeError):
+    """Raised when the bridge returns a malformed or error response.
+
+    INVARIANT-5: NEVER silently default. The caller may catch BridgeError
+    and surface a typed UI message, but we never fabricate data.
+    """
 
 
 # Type alias for the low-level bridge call. Callers can substitute a mock.
@@ -138,3 +199,119 @@ class MT5AccountClient:
     def clear_cache(self) -> None:
         self._account_cache = None
         self._symbol_cache.clear()
+
+    # -------- Phase 2: position + history methods --------
+
+    def positions_get(self) -> list[BridgePosition]:
+        """All open positions on the connected account.
+
+        Bridge MUST return a list (or {ok:True, data:[...]}). Anything else
+        raises BridgeError so the UI can surface a typed reason. NEVER
+        silently returns [] on error (INVARIANT-5).
+        """
+        resp = self._call("positions_get", {})
+        rows = self._extract_list(resp, "positions_get")
+        out: list[BridgePosition] = []
+        for r in rows:
+            try:
+                out.append(BridgePosition(
+                    ticket=int(r["ticket"]),
+                    symbol=str(r["symbol"]),
+                    type=int(r["type"]),
+                    volume=float(r["volume"]),
+                    price_open=float(r["price_open"]),
+                    sl=float(r.get("sl", 0.0)),
+                    tp=float(r.get("tp", 0.0)),
+                    price_current=float(r.get("price_current", r["price_open"])),
+                    profit=float(r.get("profit", 0.0)),
+                    swap=float(r.get("swap", 0.0)),
+                    commission=float(r.get("commission", 0.0)),
+                    time_open_utc=str(r.get("time_open_utc", r.get("time", ""))),
+                    magic=int(r.get("magic", 0)),
+                    comment=str(r.get("comment", "")),
+                ))
+            except (KeyError, ValueError, TypeError) as e:
+                raise BridgeError(
+                    f"positions_get: malformed row (missing/invalid {e!r}): {r}"
+                )
+        return out
+
+    def position_close(self, ticket: int, deviation: int = 20
+                        ) -> CloseOrderResult:
+        """Close one position by ticket. Raises BridgeError on bad shape."""
+        resp = self._call("position_close",
+                            {"ticket": int(ticket), "deviation": int(deviation)})
+        if not isinstance(resp, dict):
+            raise BridgeError(f"position_close: expected dict; got {type(resp)}")
+        # Some bridges wrap the result under data; some don't
+        d = resp.get("data", resp)
+        ok = bool(d.get("ok", resp.get("ok", True)))
+        if not ok and "error" in resp:
+            raise BridgeError(f"position_close({ticket}) failed: {resp['error']}")
+        return CloseOrderResult(
+            ok=ok,
+            retcode=int(d.get("retcode", 0)),
+            deal=int(d.get("deal", 0)),
+            price=float(d.get("price", 0.0)),
+            comment=str(d.get("comment", "")),
+        )
+
+    def history_deals_get(self, since_utc: datetime,
+                            until_utc: datetime | None = None
+                            ) -> list[BridgeDeal]:
+        """All deals in the window — including manual closes done in MT5.
+
+        `since_utc` and `until_utc` are tz-aware UTC datetimes. The bridge
+        is expected to convert to its preferred wire format.
+        """
+        params = {"since_utc": since_utc.isoformat()}
+        if until_utc is not None:
+            params["until_utc"] = until_utc.isoformat()
+        resp = self._call("history_deals_get", params)
+        rows = self._extract_list(resp, "history_deals_get")
+        out: list[BridgeDeal] = []
+        for r in rows:
+            try:
+                out.append(BridgeDeal(
+                    ticket=int(r["ticket"]),
+                    order=int(r.get("order", 0)),
+                    position_id=int(r.get("position_id", 0)),
+                    time_utc=str(r.get("time_utc", r.get("time", ""))),
+                    type=int(r.get("type", 0)),
+                    entry=int(r.get("entry", 0)),
+                    symbol=str(r["symbol"]),
+                    volume=float(r["volume"]),
+                    price=float(r["price"]),
+                    profit=float(r.get("profit", 0.0)),
+                    swap=float(r.get("swap", 0.0)),
+                    commission=float(r.get("commission", 0.0)),
+                    comment=str(r.get("comment", "")),
+                ))
+            except (KeyError, ValueError, TypeError) as e:
+                raise BridgeError(
+                    f"history_deals_get: malformed row "
+                    f"(missing/invalid {e!r}): {r}"
+                )
+        return out
+
+    @staticmethod
+    def _extract_list(resp, method_name: str) -> list[dict]:
+        """Coerce {ok, data:[...]}, {data:[...]}, or [...] → list of dicts."""
+        if isinstance(resp, list):
+            return resp
+        if isinstance(resp, dict):
+            if "data" in resp and isinstance(resp["data"], list):
+                if resp.get("ok") is False:
+                    raise BridgeError(
+                        f"{method_name}: bridge returned ok=False: "
+                        f"{resp.get('error', '<no error msg>')}"
+                    )
+                return resp["data"]
+            if resp.get("ok") is False:
+                raise BridgeError(
+                    f"{method_name}: bridge returned ok=False: "
+                    f"{resp.get('error', '<no error msg>')}"
+                )
+        raise BridgeError(
+            f"{method_name}: unexpected response shape: {type(resp).__name__}"
+        )

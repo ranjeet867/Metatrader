@@ -107,7 +107,8 @@ class LiveExecutor:
                  seen_window_seconds: float = 3600.0,
                  risk_tracker: Optional[LiveRiskTracker] = None,
                  parity_gate: Optional[ParityGate] = None,
-                 parity_max_age_hours: float = 24.0):
+                 parity_max_age_hours: float = 24.0,
+                 ftmo_clock=None):
         self.db_path = Path(db_path)
         self.risk_config = risk_config
         self.time_guard_cfg = time_guard_cfg
@@ -117,6 +118,7 @@ class LiveExecutor:
                                     else self.db_path.parent
         self.seen_window_seconds = float(seen_window_seconds)
         self.parity_max_age_hours = float(parity_max_age_hours)
+        self.ftmo_clock = ftmo_clock
 
         self.risk_tracker = risk_tracker or LiveRiskTracker(
             db_path=self.db_path,
@@ -190,6 +192,19 @@ class LiveExecutor:
                     f"({self.time_guard_cfg.no_entry_minutes_before_close} min)")
         return None
 
+    def _check_pre_ftmo_close(self, symbol: str,
+                                now_utc: datetime) -> Optional[str]:
+        """Gate #8 — refuses entries if we're inside the FTMO pre-close window
+        for this asset class. Only active when an ftmo_clock was supplied."""
+        if self.ftmo_clock is None:
+            return None
+        from core.asset_class import classify
+        ac = classify(symbol, overrides=self.risk_config.asset_class_overrides)
+        if self.ftmo_clock.is_within_pre_close_window(now_utc, ac):
+            return (f"inside FTMO pre-close window for asset class={ac!r}; "
+                    "new entries refused")
+        return None
+
     # --- main API ---
 
     def send_order(self, *, symbol: str, direction: str, lots: float,
@@ -212,6 +227,7 @@ class LiveExecutor:
             ("parity_recent", self._check_parity_recent(strategy, now)),
             ("idempotency", self._check_idempotency(idempotency_key, now_unix)),
             ("no_entry_window", self._check_no_entry_window(now)),
+            ("pre_ftmo_close", self._check_pre_ftmo_close(symbol, now)),
         ]
         for check_id, reason in checks:
             if reason is not None:

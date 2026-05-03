@@ -294,6 +294,42 @@ def test_close_does_not_check_no_entry_window(executor, tmp_path):
 # Audit trail — refusals are logged
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Pre-flight check #8 — FTMO pre-close window
+# ---------------------------------------------------------------------------
+
+def test_ftmo_pre_close_blocks_indices_but_not_fx(tmp_path):
+    """At 21:55 UTC (pre-close window), index entries are refused; FX is fine."""
+    from core.ftmo_clock import FtmoClock, FtmoRules
+    cfg = _build_cfg()
+    bridge = lambda m, p: {"ok": True, "ticket": 1}
+    ex = LiveExecutor(
+        db_path=tmp_path / "v2.db", risk_config=cfg,
+        time_guard_cfg=_build_tg_cfg(), account_login=1,
+        bridge_call=bridge, emergency_stop_dir=tmp_path,
+        ftmo_clock=FtmoClock(FtmoRules()),
+    )
+    # parity bypass
+    ex.parity_gate.record_pass("vol_breakout", 0.001,
+                                 at_utc=datetime(2026, 5, 5, 12, 0, tzinfo=timezone.utc))
+
+    pre_close = datetime(2026, 5, 5, 21, 56, tzinfo=timezone.utc)
+    # Index → blocked
+    with pytest.raises(SafetyCheckRejection) as exc:
+        ex.send_order(symbol="US100.cash", direction="LONG", lots=1,
+                       sl=99, tp=110, strategy="vol_breakout",
+                       idempotency_key="K1", now_utc=pre_close)
+    assert exc.value.check_id == "pre_ftmo_close"
+    # FX → allowed (no_entry_window may also fire here; check that the
+    # FAILURE if any is NOT pre_ftmo_close)
+    try:
+        ex.send_order(symbol="EURUSD", direction="LONG", lots=1,
+                       sl=1.10, tp=1.15, strategy="vol_breakout",
+                       idempotency_key="K2", now_utc=pre_close)
+    except SafetyCheckRejection as e:
+        assert e.check_id != "pre_ftmo_close"
+
+
 def test_refusal_is_logged_to_bridge_events(executor, tmp_path):
     with pytest.raises(SafetyCheckRejection):
         executor.send_order(symbol="X", direction="LONG", lots=1,

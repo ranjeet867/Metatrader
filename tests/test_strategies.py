@@ -22,6 +22,7 @@ from strategies.donchian_breakout import DonchianBreakout, DonchianBreakoutParam
 from strategies.rsi_meanrev import RsiMeanRev, RsiMeanRevParams
 from strategies.bbands_meanrev import BBandsMeanRev, BBandsMeanRevParams
 from strategies.ibs import Ibs, IbsParams
+from strategies.inside_bar import InsideBar, InsideBarParams
 from strategies.orb import Orb, OrbParams
 from strategies.overnight_drift import OvernightDrift, OvernightDriftParams
 from tests.fixtures.synthetic import constant, linear_ramp, sawtooth, step_function
@@ -35,6 +36,7 @@ ALL_STRATEGIES = [
     ("ibs",                lambda: Ibs(IbsParams())),
     ("overnight_drift",    lambda: OvernightDrift(OvernightDriftParams())),
     ("orb",                lambda: Orb(OrbParams())),
+    ("inside_bar",         lambda: InsideBar(InsideBarParams())),
 ]
 
 
@@ -330,6 +332,65 @@ class TestOrbStrategy:
                 assert s.stop_price < s.entry_price < s.target_price
             else:
                 assert s.target_price < s.entry_price < s.stop_price
+
+
+# ===========================================================================
+# InsideBar strategy — specific tests
+# ===========================================================================
+class TestInsideBarStrategy:
+    def _candles_with_inside_bar(self, breakout: str = "up") -> pd.DataFrame:
+        """Build 6 bars: bar 0 normal, bar 1 mother, bar 2 inside, bar 3 break,
+        bars 4-5 follow-through."""
+        n = 6
+        times = pd.date_range("2024-01-01", periods=n, freq="h", tz="UTC")
+        opens = np.array([100, 100, 100, 100, 100, 100], dtype=float)
+        highs = np.array([100.5, 102.0, 101.5, 103.5, 104.0, 104.5], dtype=float)
+        lows  = np.array([99.5,   98.0,  98.5,  99.0,  98.5,  98.0], dtype=float)
+        closes = np.array([100.0, 100.0, 100.0,
+                            103.0 if breakout == "up" else 97.0,
+                            103.5 if breakout == "up" else 96.5,
+                            104.0 if breakout == "up" else 96.0], dtype=float)
+        if breakout == "down":
+            # Make bar 3's close below bar 2's low (98.5) → SHORT trigger
+            closes[3] = 97.5  # below 98.5 ✓
+            lows[3] = 96.0
+            highs[3] = 99.0
+        # Verify bar 2 is inside bar 1: high[2]<=high[1] AND low[2]>=low[1]
+        assert highs[2] <= highs[1] and lows[2] >= lows[1]
+        return pd.DataFrame({
+            "time": times, "open": opens,
+            "high": highs, "low": lows, "close": closes,
+            "volume": np.full(n, 1000.0),
+        })
+
+    def test_long_break_fires_on_close_above_inside_high(self):
+        df = self._candles_with_inside_bar(breakout="up")
+        sigs = InsideBar(InsideBarParams()).signals(df)
+        assert any(s.bar_idx == 3 and s.direction == "LONG" for s in sigs)
+
+    def test_short_break_fires_on_close_below_inside_low(self):
+        df = self._candles_with_inside_bar(breakout="down")
+        sigs = InsideBar(InsideBarParams()).signals(df)
+        assert any(s.bar_idx == 3 and s.direction == "SHORT" for s in sigs)
+
+    def test_long_only_skips_short_breaks(self):
+        df = self._candles_with_inside_bar(breakout="down")
+        sigs = InsideBar(InsideBarParams(long_only=True)).signals(df)
+        assert all(s.direction == "LONG" for s in sigs)
+
+    def test_stop_at_inside_low_for_long(self):
+        df = self._candles_with_inside_bar(breakout="up")
+        sigs = InsideBar(InsideBarParams()).signals(df)
+        s = next(s for s in sigs if s.bar_idx == 3 and s.direction == "LONG")
+        # Inside bar (bar 2) low = 98.5
+        assert s.stop_price == 98.5
+
+    def test_target_is_2R_default(self):
+        df = self._candles_with_inside_bar(breakout="up")
+        sigs = InsideBar(InsideBarParams()).signals(df)
+        s = next(s for s in sigs if s.bar_idx == 3 and s.direction == "LONG")
+        risk = s.entry_price - s.stop_price
+        assert abs((s.target_price - s.entry_price) - 2 * risk) < 1e-9
 
 
 # ===========================================================================

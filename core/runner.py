@@ -30,6 +30,7 @@ from core.paper_executor import (
     IdempotencyCollision,
     PaperExecutor,
     PaperPosition,
+    SymbolAlreadyOpen,
 )
 from core.strategy import Signal, Strategy
 from core.time_guards import TimeGuardCfg, in_no_entry_window
@@ -183,6 +184,10 @@ def tick(view: pd.DataFrame,
             out.opens.append(pos)
         except IdempotencyCollision:
             # Same view processed twice — first call already opened, no-op
+            pass
+        except SymbolAlreadyOpen:
+            # Backtest behaviour: a second signal while a position is open
+            # is silently ignored. Replay-parity requires the same.
             pass
         except Exception as e:    # pragma: no cover — defensive
             out.errors.append(f"open: {type(e).__name__}: {e}")

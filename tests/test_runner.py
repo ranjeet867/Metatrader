@@ -195,3 +195,44 @@ def test_idempotency_key_format():
     k = make_idempotency_key("vol_breakout", "US100.cash", "H1", t)
     assert k.startswith("vol_breakout:US100.cash:H1:")
     assert "2026-05-08" in k
+
+
+# ---------------------------------------------------------------------------
+# Phase 27: dynamic position sizing through the runner
+# ---------------------------------------------------------------------------
+
+def test_runner_uses_calc_lots_when_risk_pct_supplied():
+    from core.position_sizer import SymbolInfo
+    df = _two_day_h1()
+    view = df.iloc[: 12]
+    strat = _StubStrategy(sig_bar_idx=11, candles=df)
+    ex = PaperExecutor()
+    us100 = SymbolInfo("US100.cash", tick_size=0.01, tick_value=0.01,
+                        volume_step=0.1, volume_min=0.1, volume_max=100,
+                        digits=2, contract_size=1.0)
+
+    res = tick(view, ex, strat, symbol="US100.cash", tf="H1",
+               money_per_unit_price=1.0, lots=0.0,
+               risk_pct=0.3, symbol_info=us100, account_balance=91_400)
+    # The stub fires LONG with stop=close-1 → 1.0-pt stop → big lots
+    assert len(res.opens) == 1
+    assert res.opens[0].lots > 0
+
+
+def test_runner_rejects_sizing_failure():
+    """If calc_lots returns ok=False, the open is skipped + an error logged."""
+    from core.position_sizer import SymbolInfo
+    df = _two_day_h1()
+    view = df.iloc[: 12]
+    strat = _StubStrategy(sig_bar_idx=11, candles=df)
+    ex = PaperExecutor()
+    # tiny equity → can't even afford volume_min
+    us100 = SymbolInfo("US100.cash", tick_size=0.01, tick_value=0.01,
+                        volume_step=0.1, volume_min=0.1, volume_max=100,
+                        digits=2, contract_size=1.0)
+    res = tick(view, ex, strat, symbol="US100.cash", tf="H1",
+               money_per_unit_price=1.0,
+               risk_pct=0.01, symbol_info=us100,
+               account_balance=10.0)   # $10 equity → can't size
+    assert len(res.opens) == 0
+    assert any("sizing rejected" in e for e in res.errors)

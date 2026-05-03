@@ -87,10 +87,14 @@ def tick(view: pd.DataFrame,
          symbol: str,
          tf: str,
          money_per_unit_price: float,
-         lots: float,
+         lots: float = 0.0,
          time_guard_cfg: Optional[TimeGuardCfg] = None,
          atr_period: int = 14,
          compute_atr: bool = False,
+         # ----- Phase 27: dynamic lot sizing -----
+         risk_pct: float | None = None,
+         symbol_info=None,
+         account_balance: float | None = None,
          ) -> TickResult:
     """One atomic processing step over `view` (a 1+-bar window of candles).
 
@@ -163,7 +167,25 @@ def tick(view: pd.DataFrame,
         return out
 
     # --- 5. open via idempotency-keyed call ---
+    sizing_active = (risk_pct is not None and risk_pct > 0
+                       and symbol_info is not None
+                       and account_balance is not None)
     for sig in new_sigs:
+        # Compute lots: dynamic if sizing config supplied, else fixed `lots`.
+        if sizing_active:
+            from core.position_sizer import calc_lots
+            res = calc_lots(
+                equity=float(account_balance), risk_pct=float(risk_pct),
+                entry_price=sig.entry_price, stop_price=sig.stop_price,
+                sym=symbol_info,
+            )
+            if not res.ok:
+                out.errors.append(f"sizing rejected: {res.reason}")
+                continue
+            trade_lots = res.lots
+        else:
+            trade_lots = float(lots)
+
         key = make_idempotency_key(
             strategy.name, symbol, tf, view["time"].iloc[last_idx]
         )
@@ -174,7 +196,7 @@ def tick(view: pd.DataFrame,
                 signal_entry_price=sig.entry_price,
                 stop_price=sig.stop_price,
                 target_price=sig.target_price,
-                lots=lots,
+                lots=trade_lots,
                 money_per_unit_price=money_per_unit_price,
                 idempotency_key=key,
                 opened_at_bar_idx=last_idx,

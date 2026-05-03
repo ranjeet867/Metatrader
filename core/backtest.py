@@ -186,7 +186,7 @@ def run_backtest(
     signals: list[Signal],
     *,
     starting_balance: float,
-    lots: float,
+    lots: float = 0.0,
     money_per_unit_price: float,
     commission_per_trade: float = 0.0,
     slippage_per_fill_atr_frac: float = 0.0,
@@ -202,6 +202,13 @@ def run_backtest(
     us_session_close_hhmm: str = "20:00",
     flat_buffer_minutes: int = 5,
     no_entry_minutes_before_close: int = 0,
+    # ----- Phase 27: dynamic lot sizing.
+    # If both risk_pct and symbol_info are provided, lots are recomputed
+    # per-trade via core.position_sizer.calc_lots. Falls back to fixed
+    # `lots` when either is None (backwards compat).
+    risk_pct: float | None = None,
+    symbol_info=None,
+    sizing_uses_running_balance: bool = True,
 ) -> BacktestResult:
     """Run a single-position backtest.
 
@@ -279,10 +286,14 @@ def run_backtest(
     open_pos: Optional[Signal] = None     # the signal that opened the current position
     actual_entry: float = 0.0             # post-slippage fill price for the open position
     entry_slip_abs: float = 0.0           # |slip| at entry, recorded for the trade record
+    current_lots: float = float(lots)     # dynamic per-trade when risk_pct is on
 
     trades: list[ClosedTrade] = []
     equity_rows: list[dict] = []
     skipped_signals = 0
+    skipped_for_sizing = 0
+    sizing_active = (risk_pct is not None and risk_pct > 0
+                       and symbol_info is not None)
 
     def _close_at_bar(i: int, level_price: float, close_reason: CloseReason) -> None:
         """Close the currently-open position at bar i with the given level.
@@ -290,7 +301,7 @@ def run_backtest(
         Apply exit slippage AGAINST the trade. Append a ClosedTrade, update
         balance, clear open_pos / actual_entry / entry_slip_abs.
         """
-        nonlocal balance, open_pos, actual_entry, entry_slip_abs
+        nonlocal balance, open_pos, actual_entry, entry_slip_abs, current_lots
         sig = open_pos
         assert sig is not None
         exit_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
@@ -300,9 +311,9 @@ def run_backtest(
             actual_exit = level_price + exit_slip_abs
 
         sign = 1.0 if sig.direction == "LONG" else -1.0
-        gross = (actual_exit - actual_entry) * sign * lots * money_per_unit_price
+        gross = (actual_exit - actual_entry) * sign * current_lots * money_per_unit_price
         pnl = gross - commission_per_trade
-        init_risk = abs(sig.entry_price - sig.stop_price) * lots * money_per_unit_price
+        init_risk = abs(sig.entry_price - sig.stop_price) * current_lots * money_per_unit_price
         r_multiple = pnl / init_risk if init_risk > 0 else 0.0
 
         trades.append(ClosedTrade(
@@ -313,7 +324,7 @@ def run_backtest(
             stop_price=sig.stop_price,
             target_price=sig.target_price,
             exit_price=actual_exit,
-            lots=lots,
+            lots=current_lots,
             money_per_unit_price=money_per_unit_price,
             realized_pnl=pnl,
             r_multiple=r_multiple,
@@ -381,12 +392,37 @@ def run_backtest(
                             f"bad SHORT signal at bar {i}: target={sig.target_price}, "
                             f"entry={sig.entry_price}, stop={sig.stop_price}"
                         )
-                open_pos = sig
-                entry_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
-                if sig.direction == "LONG":
-                    actual_entry = sig.entry_price + entry_slip_abs
+                # ---- Phase 27: dynamic per-trade lot sizing ----
+                if sizing_active:
+                    from core.position_sizer import calc_lots
+                    sizing_balance = balance if sizing_uses_running_balance else starting_balance
+                    res = calc_lots(
+                        equity=sizing_balance, risk_pct=float(risk_pct),
+                        entry_price=sig.entry_price, stop_price=sig.stop_price,
+                        sym=symbol_info,
+                    )
+                    if not res.ok:
+                        skipped_for_sizing += 1
+                        # Don't open this trade
+                        # (proceed to step 3/4 with no position open)
+                        # NOTE: we still consume the signal — backtest behaviour
+                        # is "FIRST signal whose bar_idx > open close"; rejected
+                        # signals do not block later signals.
+                    else:
+                        current_lots = res.lots
+                        open_pos = sig
+                        entry_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
+                        actual_entry = (sig.entry_price + entry_slip_abs
+                                          if sig.direction == "LONG"
+                                          else sig.entry_price - entry_slip_abs)
                 else:
-                    actual_entry = sig.entry_price - entry_slip_abs
+                    current_lots = float(lots)
+                    open_pos = sig
+                    entry_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
+                    if sig.direction == "LONG":
+                        actual_entry = sig.entry_price + entry_slip_abs
+                    else:
+                        actual_entry = sig.entry_price - entry_slip_abs
 
         # ----- 3. END-OF-DATA close: any position still open on the last bar exits at close.
         # IMPORTANT: this runs AFTER step 2 so a same-bar entry+EOD-exit is fully accounted
@@ -398,7 +434,7 @@ def run_backtest(
         # ----- 4. Mark-to-market equity at this bar's CLOSE
         if open_pos is not None:
             sign = 1.0 if open_pos.direction == "LONG" else -1.0
-            floating = (close[i] - actual_entry) * sign * lots * money_per_unit_price
+            floating = (close[i] - actual_entry) * sign * current_lots * money_per_unit_price
             equity = balance + floating
         else:
             equity = balance

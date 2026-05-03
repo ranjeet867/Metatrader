@@ -23,6 +23,7 @@ Output: BacktestResult containing closed trades + equity curve + reconciliation 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 import numpy as np
@@ -30,9 +31,16 @@ import pandas as pd
 
 from core.indicators import atr_wilder
 from core.strategy import Signal
+from core.time_guards import (
+    TimeGuardCfg,
+    in_no_entry_window,
+    needs_daily_flat,
+    needs_weekend_flat,
+)
 
 
-CloseReason = Literal["target", "stop", "time", "end_of_data"]
+CloseReason = Literal["target", "stop", "time", "end_of_data",
+                       "weekend_flat", "daily_close_flat"]
 
 
 @dataclass
@@ -65,10 +73,17 @@ class BacktestResult:
     equity_curve_pnl: float
     reconciles: bool             # |sum_pnl - eq_pnl| < 0.01
     reconcile_tolerance: float = 0.01
+    skipped_signals: int = 0     # signals dropped because in_no_entry_window
 
     @property
     def n_trades(self) -> int:
         return len(self.trades)
+
+    @property
+    def reconcile_divergence(self) -> float:
+        """Signed divergence in dollars: sum_realized - equity_pnl. INVARIANT-1
+        is satisfied iff abs(divergence) < reconcile_tolerance."""
+        return self.sum_realized_pnl - self.equity_curve_pnl
 
 
 @dataclass
@@ -177,6 +192,16 @@ def run_backtest(
     slippage_per_fill_atr_frac: float = 0.0,
     slippage_atr_period: int = 14,
     reconcile_tolerance: float = 0.01,
+    # ----- INVARIANT-8: time-based forced exits (default OFF for backwards
+    # compatibility with the existing 116 tests; opt-in per call site) -----
+    symbol: str = "",
+    enforce_weekend_flat: bool = False,
+    enforce_daily_flat: bool = False,
+    asset_class_overrides: dict | None = None,
+    daily_close_flat_classes: tuple[str, ...] = ("stock", "index"),
+    us_session_close_hhmm: str = "20:00",
+    flat_buffer_minutes: int = 5,
+    no_entry_minutes_before_close: int = 0,
 ) -> BacktestResult:
     """Run a single-position backtest.
 
@@ -223,6 +248,33 @@ def run_backtest(
     # Index signals by bar_idx for fast lookup
     signals_by_bar = {s.bar_idx: s for s in signals if 0 <= s.bar_idx < n}
 
+    # ----- INVARIANT-8 plumbing: detect timeframe + build TimeGuardCfg -----
+    # tf_seconds is the median bar interval; used to project bar_close_time =
+    # bar.time + tf_seconds. Only computed when at least one time-guard is on.
+    time_guards_active = (enforce_weekend_flat or enforce_daily_flat
+                            or no_entry_minutes_before_close > 0)
+    tf_seconds = 0
+    times_pd = candles["time"]   # tz-aware pandas Series
+    if time_guards_active and n >= 2:
+        diffs = times_pd.diff().dt.total_seconds().dropna().to_numpy()
+        tf_seconds = int(np.median(diffs))
+
+    tg_cfg = TimeGuardCfg(
+        weekend_flat_all=enforce_weekend_flat,
+        daily_close_flat_classes=daily_close_flat_classes,
+        us_session_close_hhmm=us_session_close_hhmm,
+        flat_buffer_minutes=flat_buffer_minutes,
+        no_entry_minutes_before_close=no_entry_minutes_before_close,
+        asset_class_overrides=asset_class_overrides,
+    )
+
+    def _bar_close_utc(i: int) -> datetime:
+        """The UTC datetime that bar i closes at (== start of bar i+1)."""
+        ts = times_pd.iloc[i]
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        return (ts + pd.Timedelta(seconds=tf_seconds)).to_pydatetime()
+
     balance = float(starting_balance)
     open_pos: Optional[Signal] = None     # the signal that opened the current position
     actual_entry: float = 0.0             # post-slippage fill price for the open position
@@ -230,6 +282,7 @@ def run_backtest(
 
     trades: list[ClosedTrade] = []
     equity_rows: list[dict] = []
+    skipped_signals = 0
 
     def _close_at_bar(i: int, level_price: float, close_reason: CloseReason) -> None:
         """Close the currently-open position at bar i with the given level.
@@ -295,29 +348,45 @@ def run_backtest(
                 # Time-based exit: force-close at this bar's CLOSE.
                 _close_at_bar(i, close[i], "time")
 
+        # ----- 1b. INVARIANT-8: time-based forced flats (after SL/TP, before opens)
+        # Weekend-flat takes precedence over daily-flat (Friday IS a weekday).
+        if open_pos is not None and time_guards_active and tf_seconds > 0:
+            bc_utc = _bar_close_utc(i)
+            if enforce_weekend_flat and needs_weekend_flat(bc_utc, tg_cfg):
+                _close_at_bar(i, close[i], "weekend_flat")
+            elif (enforce_daily_flat and symbol
+                  and needs_daily_flat(symbol, bc_utc, tg_cfg)):
+                _close_at_bar(i, close[i], "daily_close_flat")
+
         # ----- 2. After resolving any intrabar close, open a new position on this bar?
         # We open at the close of the SIGNAL bar (so signal.bar_idx == i means open here).
         if open_pos is None and i in signals_by_bar:
             sig = signals_by_bar[i]
-            # sanity-check the signal's geometry
-            if sig.direction == "LONG":
-                if not (sig.stop_price < sig.entry_price < sig.target_price):
-                    raise ValueError(
-                        f"bad LONG signal at bar {i}: stop={sig.stop_price}, "
-                        f"entry={sig.entry_price}, target={sig.target_price}"
-                    )
+            # NO-ENTRY WINDOW: refuse to open if the bar's close-time falls
+            # in the configured pre-close window (live-trading discipline).
+            if (no_entry_minutes_before_close > 0 and tf_seconds > 0
+                and in_no_entry_window(_bar_close_utc(i), tg_cfg)):
+                skipped_signals += 1
             else:
-                if not (sig.target_price < sig.entry_price < sig.stop_price):
-                    raise ValueError(
-                        f"bad SHORT signal at bar {i}: target={sig.target_price}, "
-                        f"entry={sig.entry_price}, stop={sig.stop_price}"
-                    )
-            open_pos = sig
-            entry_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
-            if sig.direction == "LONG":
-                actual_entry = sig.entry_price + entry_slip_abs
-            else:
-                actual_entry = sig.entry_price - entry_slip_abs
+                # sanity-check the signal's geometry
+                if sig.direction == "LONG":
+                    if not (sig.stop_price < sig.entry_price < sig.target_price):
+                        raise ValueError(
+                            f"bad LONG signal at bar {i}: stop={sig.stop_price}, "
+                            f"entry={sig.entry_price}, target={sig.target_price}"
+                        )
+                else:
+                    if not (sig.target_price < sig.entry_price < sig.stop_price):
+                        raise ValueError(
+                            f"bad SHORT signal at bar {i}: target={sig.target_price}, "
+                            f"entry={sig.entry_price}, stop={sig.stop_price}"
+                        )
+                open_pos = sig
+                entry_slip_abs = atr_series[i] * slippage_per_fill_atr_frac
+                if sig.direction == "LONG":
+                    actual_entry = sig.entry_price + entry_slip_abs
+                else:
+                    actual_entry = sig.entry_price - entry_slip_abs
 
         # ----- 3. END-OF-DATA close: any position still open on the last bar exits at close.
         # IMPORTANT: this runs AFTER step 2 so a same-bar entry+EOD-exit is fully accounted
@@ -352,4 +421,5 @@ def run_backtest(
         equity_curve_pnl=eq_pnl,
         reconciles=reconciles,
         reconcile_tolerance=reconcile_tolerance,
+        skipped_signals=skipped_signals,
     )

@@ -23,7 +23,7 @@ from core import storage
 V2_TABLES = {
     "candles", "trades", "runs", "schema_version",
     "paper_runs", "live_runs", "risk_state", "ftmo_daily_resets",
-    "parity_log", "bridge_events", "trade_notes",
+    "parity_log", "bridge_events", "trade_notes", "forced_flat_events",
 }
 
 V2_TRADE_COLUMNS = {
@@ -214,6 +214,42 @@ class TestUpsertWriters:
         assert s["consecutive_losses"] == 0
         assert s["daily_loss_pct"] == 0
         assert s["day_start_balance"] == 99_000
+
+    def test_live_run_requires_account_login(self):
+        """live_runs.account_login is NOT NULL — passing None must fail."""
+        db = _tmp_db()
+        storage.init_schema(db)
+        # Happy path
+        storage.upsert_live_run(db, "L1", started_at_utc="t0", status="running",
+                                config_json="{}", account_login=12345)
+        # Missing account_login should raise
+        import pytest
+        with pytest.raises((sqlite3.IntegrityError, TypeError)):
+            storage.upsert_live_run(db, "L2", started_at_utc="t0",
+                                    status="running", config_json="{}",
+                                    account_login=None)
+
+    def test_forced_flat_event_idempotent(self):
+        db = _tmp_db()
+        storage.init_schema(db)
+        storage.record_forced_flat(db, "2026-04-25T19:55:00Z", "US100.cash",
+                                   mode="paper", reason="weekend_flat",
+                                   mark_price=21000.0, pnl_at_close=147.20)
+        storage.record_forced_flat(db, "2026-04-25T19:55:00Z", "US100.cash",
+                                   mode="paper", reason="weekend_flat",
+                                   mark_price=21000.0, pnl_at_close=147.20)
+        with storage.connect(db) as c:
+            n = c.execute("SELECT COUNT(*) FROM forced_flat_events").fetchone()[0]
+        assert n == 1
+
+    def test_forced_flat_rejects_bad_reason(self):
+        db = _tmp_db()
+        storage.init_schema(db)
+        import pytest
+        with pytest.raises(sqlite3.IntegrityError):
+            storage.record_forced_flat(db, "2026-04-25T19:55:00Z", "US100.cash",
+                                       mode="paper", reason="random_reason",
+                                       mark_price=21000.0, pnl_at_close=0.0)
 
     def test_save_trades_with_v2_fields(self):
         """Trades dicts may include new metadata; columns persist correctly."""

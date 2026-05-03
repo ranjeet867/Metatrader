@@ -115,7 +115,7 @@ SCHEMA_DDL = [
         status              TEXT CHECK (status IN ('running','stopped','crashed','finished')),
         config_json         TEXT NOT NULL,
         heartbeat_at_utc    TEXT,
-        mt5_account_login   INTEGER
+        account_login       INTEGER NOT NULL
     )
     """,
     """
@@ -164,6 +164,17 @@ SCHEMA_DDL = [
         note                TEXT,
         updated_at_utc      TEXT,
         PRIMARY KEY (trade_run_id, trade_idx)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS forced_flat_events (
+        occurred_at_utc     TEXT NOT NULL,
+        symbol              TEXT NOT NULL,
+        mode                TEXT NOT NULL CHECK (mode IN ('backtest','paper','live')),
+        reason              TEXT NOT NULL CHECK (reason IN ('weekend_flat','daily_close_flat')),
+        mark_price          REAL,
+        pnl_at_close        REAL,
+        PRIMARY KEY (occurred_at_utc, symbol)
     )
     """,
 ]
@@ -412,15 +423,14 @@ def heartbeat_paper_run(db_path: str | Path, run_id: str, at_utc: str) -> None:
 
 
 def upsert_live_run(db_path: str | Path, run_id: str, *, started_at_utc: str,
-                    status: str, config_json: str,
+                    status: str, config_json: str, account_login: int,
                     finished_at_utc: str | None = None,
-                    heartbeat_at_utc: str | None = None,
-                    mt5_account_login: int | None = None) -> None:
+                    heartbeat_at_utc: str | None = None) -> None:
     with connect(db_path) as c:
         c.execute(
             """
             INSERT INTO live_runs (run_id, started_at_utc, finished_at_utc, status,
-                                    config_json, heartbeat_at_utc, mt5_account_login)
+                                    config_json, heartbeat_at_utc, account_login)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id) DO UPDATE SET
                 finished_at_utc = excluded.finished_at_utc,
@@ -428,7 +438,26 @@ def upsert_live_run(db_path: str | Path, run_id: str, *, started_at_utc: str,
                 heartbeat_at_utc = excluded.heartbeat_at_utc
             """,
             (run_id, started_at_utc, finished_at_utc, status, config_json,
-             heartbeat_at_utc, mt5_account_login),
+             heartbeat_at_utc, account_login),
+        )
+
+
+def record_forced_flat(db_path: str | Path, occurred_at_utc: str, symbol: str,
+                        mode: str, reason: str, mark_price: float,
+                        pnl_at_close: float) -> None:
+    """Audit the time-guard forced-close. Idempotent on (occurred_at, symbol).
+
+    NB: we use ON CONFLICT DO NOTHING (not INSERT OR IGNORE) so that CHECK
+    constraint violations on `mode` / `reason` still raise — only primary-key
+    conflicts (the actual idempotency case) are absorbed.
+    """
+    with connect(db_path) as c:
+        c.execute(
+            "INSERT INTO forced_flat_events "
+            "(occurred_at_utc, symbol, mode, reason, mark_price, pnl_at_close) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(occurred_at_utc, symbol) DO NOTHING",
+            (occurred_at_utc, symbol, mode, reason, mark_price, pnl_at_close),
         )
 
 

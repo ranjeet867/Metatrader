@@ -126,6 +126,46 @@ def partition_train_test(result: BacktestResult, train_pct: float,
     return train_metrics, test_metrics
 
 
+def apply_entry_slip(direction: str, entry_price: float, slip_abs: float) -> float:
+    """Apply slippage AGAINST the trade at entry. Always slip_abs >= 0.
+
+    LONG fills ABOVE the signal price; SHORT fills BELOW. This is the single
+    source of truth — paper_executor and live_executor both call this.
+    """
+    return entry_price + slip_abs if direction == "LONG" else entry_price - slip_abs
+
+
+def apply_exit_slip(direction: str, level_price: float, slip_abs: float) -> float:
+    """Apply slippage AGAINST the trade at exit. Always slip_abs >= 0.
+
+    LONG exits BELOW the SL/TP/close level; SHORT exits ABOVE. Mirror of entry.
+    """
+    return level_price - slip_abs if direction == "LONG" else level_price + slip_abs
+
+
+def compute_realized_pnl(direction: str, actual_entry: float, actual_exit: float,
+                          lots: float, money_per_unit_price: float,
+                          commission_per_trade: float) -> float:
+    """Single source-of-truth realized-PnL formula.
+
+    INVARIANT-3: backtest, replay, paper, and live all compute realized PnL
+    via THIS function. New code paths cannot define their own PnL formula.
+    """
+    sign = 1.0 if direction == "LONG" else -1.0
+    gross = (actual_exit - actual_entry) * sign * lots * money_per_unit_price
+    return gross - commission_per_trade
+
+
+def compute_initial_dollar_risk(direction: str, signal_entry_price: float,
+                                stop_price: float, lots: float,
+                                money_per_unit_price: float) -> float:
+    """Pre-slippage risk: |entry - stop| × lots × money_per_unit_price.
+
+    Used to compute R-multiple. Identical on backtest / paper / live.
+    """
+    return abs(signal_entry_price - stop_price) * lots * money_per_unit_price
+
+
 def run_backtest(
     candles: pd.DataFrame,
     signals: list[Signal],

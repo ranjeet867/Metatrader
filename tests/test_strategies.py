@@ -22,6 +22,7 @@ from strategies.donchian_breakout import DonchianBreakout, DonchianBreakoutParam
 from strategies.rsi_meanrev import RsiMeanRev, RsiMeanRevParams
 from strategies.bbands_meanrev import BBandsMeanRev, BBandsMeanRevParams
 from strategies.ibs import Ibs, IbsParams
+from strategies.overnight_drift import OvernightDrift, OvernightDriftParams
 from tests.fixtures.synthetic import constant, linear_ramp, sawtooth, step_function
 
 
@@ -31,6 +32,7 @@ ALL_STRATEGIES = [
     ("rsi_meanrev",        lambda: RsiMeanRev(RsiMeanRevParams())),
     ("bbands_meanrev",     lambda: BBandsMeanRev(BBandsMeanRevParams())),
     ("ibs",                lambda: Ibs(IbsParams())),
+    ("overnight_drift",    lambda: OvernightDrift(OvernightDriftParams())),
 ]
 
 
@@ -190,6 +192,40 @@ class TestIbsStrategy:
         df = constant(price=100, n_bars=300)
         sigs = Ibs(IbsParams()).signals(df)
         assert sigs == []
+
+
+# ===========================================================================
+# OvernightDrift strategy — specific tests
+# ===========================================================================
+class TestOvernightDriftStrategy:
+    def test_only_emits_long(self):
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=5, down_bars=5, n_cycles=20)
+        sigs = OvernightDrift(OvernightDriftParams()).signals(df)
+        assert all(s.direction == "LONG" for s in sigs)
+
+    def test_one_signal_per_eligible_bar(self):
+        """OvernightDrift emits a signal at every bar (after warm-up, before last)."""
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=5, down_bars=5, n_cycles=20)
+        params = OvernightDriftParams(atr_period=14)
+        sigs = OvernightDrift(params).signals(df)
+        # Eligible bars: [atr_period, n-2] inclusive  → n - 1 - atr_period
+        assert len(sigs) == len(df) - 1 - params.atr_period
+
+    def test_max_hold_bars_is_one_by_default(self):
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=5, down_bars=5, n_cycles=20)
+        sigs = OvernightDrift(OvernightDriftParams()).signals(df)
+        for s in sigs:
+            assert s.max_hold_bars == 1
+
+    def test_does_not_emit_at_last_bar(self):
+        df = sawtooth(low_price=100, high_price=110,
+                       up_bars=5, down_bars=5, n_cycles=20)
+        sigs = OvernightDrift(OvernightDriftParams()).signals(df)
+        last = len(df) - 1
+        assert not any(s.bar_idx == last for s in sigs)
 
 
 # ===========================================================================

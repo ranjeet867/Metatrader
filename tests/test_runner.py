@@ -81,6 +81,67 @@ def test_signal_at_last_bar_fires_open():
     assert ex.has_position("US100.cash")
 
 
+def test_circuit_breaker_blocks_open():
+    """When block_opens_reason is set, the tick must NOT open a new
+    position even if the signal fires. update_bar still runs, but the
+    counter increments."""
+    df = _two_day_h1()
+    view = df.iloc[: 12]
+    strat = _StubStrategy(sig_bar_idx=11, candles=df)
+    ex = PaperExecutor()
+    res = tick(view, ex, strat, symbol="US100.cash", tf="H1",
+               money_per_unit_price=1.0, lots=1.0,
+               block_opens_reason="DAILY LOSS exceeded $4500")
+    assert len(res.opens) == 0
+    assert not ex.has_position("US100.cash")
+    assert res.skipped_due_to_circuit_breaker == 1
+    assert any("DAILY LOSS" in e for e in res.errors)
+
+
+def test_position_guard_blocks_when_other_dep_holds_symbol():
+    """When another deployment already has a position on the same
+    symbol, the strict policy blocks the new open."""
+    from core.position_guard import OpenPosition
+
+    df = _two_day_h1()
+    view = df.iloc[: 12]
+    strat = _StubStrategy(sig_bar_idx=11, candles=df)
+    ex = PaperExecutor()
+    snapshot = [OpenPosition(
+        deployment_id="other_dep", symbol="US100.cash",
+        side="LONG", lots=1.0, opened_at_utc="2026-05-03T12:00:00",
+    )]
+    res = tick(view, ex, strat, symbol="US100.cash", tf="H1",
+               money_per_unit_price=1.0, lots=1.0,
+               deployment_id="my_dep",
+               open_positions_snapshot=snapshot,
+               position_guard_policy="strict")
+    assert len(res.opens) == 0
+    assert res.skipped_due_to_position_guard == 1
+    assert any("position_guard" in e for e in res.errors)
+
+
+def test_position_guard_allows_when_no_collision():
+    """No conflicting position → guard returns ALLOW → open fires."""
+    from core.position_guard import OpenPosition
+
+    df = _two_day_h1()
+    view = df.iloc[: 12]
+    strat = _StubStrategy(sig_bar_idx=11, candles=df)
+    ex = PaperExecutor()
+    snapshot = [OpenPosition(
+        deployment_id="other_dep", symbol="EURUSD",
+        side="LONG", lots=1.0, opened_at_utc="2026-05-03T12:00:00",
+    )]
+    res = tick(view, ex, strat, symbol="US100.cash", tf="H1",
+               money_per_unit_price=1.0, lots=1.0,
+               deployment_id="my_dep",
+               open_positions_snapshot=snapshot,
+               position_guard_policy="strict")
+    assert len(res.opens) == 1
+    assert res.skipped_due_to_position_guard == 0
+
+
 def test_signal_not_on_last_bar_ignored():
     """A signal whose bar_idx isn't the last bar of the view must NOT fire.
     This is the live-mode discipline."""

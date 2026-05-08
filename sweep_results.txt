@@ -1,0 +1,240 @@
+Strategy variants: 42
+Tickers: 13
+Timeframes: D1, H1, M15
+
+
+=== EURUSD D1: 2,000 bars  7.71y ===
+
+=== EURUSD H1: 8,000 bars  1.28y ===
+  ✅ ema_cross_12_26_RR_1:3_long                n=  43 PF=1.30 R=+0.22 DD=3.1% recov=76d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  45 PF=1.11 R=+0.09 DD=2.8% recov=104d
+
+=== EURUSD M15: 8,122 bars  0.32y ===
+  ✅ rsi_30_70_RR_1:1_long                      n=  39 PF=1.31 R=+0.13 DD=1.7% recov=5d
+
+=== GBPUSD D1: 2,000 bars  7.71y ===
+
+=== GBPUSD H1: 8,000 bars  1.28y ===
+  ✅ donchian_20_RR_1:3_long                    n=  76 PF=1.09 R=+0.08 DD=4.0% recov=43d
+  ✅ donchian_20_RR_1:3_long_+200ema            n=  59 PF=1.09 R=+0.07 DD=3.6% recov=39d
+  ✅ rsi_30_70_RR_1:1_long                      n=  34 PF=1.22 R=+0.10 DD=2.1% recov=45d
+
+=== GBPUSD M15: 8,000 bars  0.32y ===
+  ✅ rsi_30_70_RR_1:1_long                      n=  43 PF=1.30 R=+0.13 DD=3.0% recov=28d
+
+=== US100.cash D1: 1,368 bars  5.29y ===
+  ✅ donchian_20_RR_1:1_long                    n=  31 PF=1.32 R=+0.13 DD=1.4% recov=147d
+  ✅ donchian_20_RR_1:2_long_+200ema            n=  19 PF=1.95 R=+0.50 DD=1.7% recov=77d
+  ✅ donchian_20_RR_1:3_long_+200ema            n=  16 PF=1.84 R=+0.52 DD=1.9% recov=122d
+  ✅ donchian_55_RR_1:1_long                    n=  23 PF=1.89 R=+0.29 DD=1.0% recov=84d
+
+=== US100.cash H1: 8,000 bars  1.36y ===
+  ✅ ema_cross_9_20_RR_1:3_bidir                n=  79 PF=1.11 R=+0.09 DD=4.7% recov=49d
+  ✅ ema_cross_12_26_RR_1:2_bidir               n=  80 PF=1.24 R=+0.16 DD=4.5% recov=48d
+  ✅ ema_cross_12_26_RR_1:2_long                n=  45 PF=1.18 R=+0.12 DD=3.7% recov=157d
+  ✅ donchian_20_RR_1:3_long                    n=  64 PF=1.23 R=+0.17 DD=5.3% recov=33d
+  ✅ donchian_55_RR_1:3_long                    n=  45 PF=1.49 R=+0.34 DD=5.9% recov=34d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  45 PF=1.35 R=+0.25 DD=5.0% recov=28d
+
+=== US100.cash M15: 8,113 bars  0.33y ===
+  ✅ ema_cross_9_20_RR_1:2_bidir                n=  83 PF=1.50 R=+0.29 DD=9.0% recov=50d
+  ✅ ema_cross_9_20_RR_1:2_long                 n=  49 PF=1.72 R=+0.39 DD=5.9% recov=32d
+  ✅ donchian_20_RR_1:1_long                    n= 136 PF=1.33 R=+0.14 DD=5.9% recov=29d
+  ✅ donchian_20_RR_1:2_long                    n=  92 PF=1.56 R=+0.32 DD=6.1% recov=36d
+  ✅ donchian_20_RR_1:3_long                    n=  71 PF=1.37 R=+0.27 DD=7.8% recov=36d
+  ✅ donchian_20_RR_1:2_long_+200ema            n=  84 PF=1.54 R=+0.31 DD=6.0% recov=29d
+  ✅ donchian_55_RR_1:1_long                    n= 100 PF=1.18 R=+0.08 DD=4.2% recov=17d
+  ✅ donchian_55_RR_1:2_long                    n=  79 PF=1.27 R=+0.17 DD=3.9% recov=15d
+
+=== US500.cash D1: 1,368 bars  5.29y ===
+
+=== US500.cash H1: 8,000 bars  1.36y ===
+  ✅ ema_cross_12_26_RR_1:3_long                n=  38 PF=1.10 R=+0.08 DD=6.6% recov=122d
+  ✅ donchian_20_RR_1:3_bidir                   n= 122 PF=1.25 R=+0.19 DD=6.3% recov=124d
+  ✅ rsi_25_75_RR_1:2_long                      n=  19 PF=1.96 R=+0.50 DD=1.8% recov=21d
+
+=== US500.cash M15: 8,000 bars  0.33y ===
+  ✅ ema_cross_9_20_RR_1:2_long                 n=  54 PF=1.32 R=+0.20 DD=5.7% recov=58d
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  52 PF=1.31 R=+0.23 DD=6.0% recov=28d
+  ✅ ema_cross_12_26_RR_1:2_long                n=  43 PF=1.28 R=+0.17 DD=5.7% recov=28d
+  ✅ ema_cross_12_26_RR_1:3_long                n=  40 PF=1.15 R=+0.12 DD=4.9% recov=28d
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  35 PF=1.18 R=+0.12 DD=4.0% recov=17d
+  ✅ donchian_20_RR_1:2_bidir                   n= 148 PF=1.29 R=+0.18 DD=4.6% recov=23d
+  ✅ donchian_20_RR_1:2_long                    n=  88 PF=1.38 R=+0.23 DD=3.8% recov=22d
+  ✅ donchian_20_RR_1:2_long_+200ema            n=  74 PF=1.56 R=+0.31 DD=3.3% recov=8d
+  ✅ donchian_20_RR_1:3_long_+200ema            n=  70 PF=1.09 R=+0.08 DD=6.2% recov=36d
+  ✅ donchian_55_RR_1:2_long                    n=  67 PF=1.31 R=+0.19 DD=3.9% recov=2d
+  ✅ donchian_55_RR_1:2_long_+200ema            n=  63 PF=1.37 R=+0.22 DD=4.2% recov=2d
+  ✅ rsi_20_80_RR_1:1_bidir                     n=  20 PF=1.28 R=+0.12 DD=1.5% recov=10d
+
+=== US30.cash D1: 1,851 bars  7.24y ===
+
+=== US30.cash H1: 8,028 bars  1.36y ===
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  58 PF=1.12 R=+0.09 DD=7.1% recov=127d
+  ✅ ema_cross_12_26_RR_1:1_bidir               n=  85 PF=1.48 R=+0.19 DD=5.8% recov=168d
+  ✅ ema_cross_12_26_RR_1:2_bidir               n=  80 PF=1.44 R=+0.27 DD=7.7% recov=130d
+  ✅ ema_cross_12_26_RR_1:3_long                n=  43 PF=1.17 R=+0.13 DD=4.5% recov=33d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  26 PF=1.42 R=+0.31 DD=2.7% recov=15d
+  ✅ donchian_20_RR_1:2_long_+200ema            n=  79 PF=1.14 R=+0.10 DD=4.9% recov=48d
+  ✅ donchian_55_RR_1:2_long_+200ema            n=  47 PF=1.31 R=+0.20 DD=4.8% recov=96d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  38 PF=1.74 R=+0.50 DD=5.9% recov=175d
+  ✅ rsi_25_75_RR_1:2_bidir                     n=  55 PF=1.27 R=+0.17 DD=3.2% recov=46d
+
+=== US30.cash M15: 8,000 bars  0.33y ===
+  ✅ rsi_20_80_RR_1:2_bidir                     n=  20 PF=1.45 R=+0.27 DD=2.7% recov=64d
+
+=== JP225.cash D1: 1,372 bars  8.35y ===
+
+=== JP225.cash H1: 8,000 bars  1.36y ===
+
+=== JP225.cash M15: 8,113 bars  0.33y ===
+  ✅ ema_cross_9_20_RR_1:2_long                 n=  62 PF=1.54 R=+0.34 DD=54.5% recov=21d
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  54 PF=1.69 R=+0.41 DD=67.4% recov=29d
+  ✅ donchian_20_RR_1:2_long                    n=  97 PF=1.33 R=+0.23 DD=60.7% recov=42d
+  ✅ donchian_20_RR_1:3_long                    n=  81 PF=1.25 R=+0.21 DD=64.7% recov=29d
+
+=== HK50.cash D1: 1,333 bars  5.42y ===
+
+=== HK50.cash H1: 8,019 bars  1.80y ===
+  ✅ ema_cross_9_20_RR_1:2_long                 n=  63 PF=1.49 R=+0.31 DD=21.3% recov=46d
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  26 PF=1.81 R=+0.43 DD=14.5% recov=44d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  25 PF=1.49 R=+0.37 DD=13.6% recov=46d
+
+=== HK50.cash M15: 8,074 bars  0.54y ===
+  ✅ ema_cross_12_26_RR_1:1_long                n=  44 PF=1.12 R=+0.07 DD=22.2% recov=40d
+  ✅ ema_cross_12_26_RR_1:2_bidir               n=  78 PF=1.74 R=+0.39 DD=31.1% recov=61d
+  ✅ ema_cross_12_26_RR_1:2_long                n=  42 PF=1.73 R=+0.43 DD=28.1% recov=32d
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  19 PF=1.92 R=+0.51 DD=13.3% recov=6d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  19 PF=1.51 R=+0.41 DD=21.4% recov=4d
+
+=== GER40.cash D1: 1,590 bars  8.11y ===
+  ✅ ema_cross_12_26_RR_1:1_bidir               n=  22 PF=1.22 R=+0.10 DD=0.9% recov=174d
+  ✅ donchian_20_RR_1:3_long_+200ema            n=  17 PF=2.17 R=+0.68 DD=1.6% recov=119d
+
+=== GER40.cash H1: 8,000 bars  1.40y ===
+  ✅ donchian_20_RR_1:1_bidir                   n= 242 PF=1.29 R=+0.12 DD=6.0% recov=50d
+  ✅ donchian_20_RR_1:1_long                    n= 122 PF=1.31 R=+0.13 DD=3.8% recov=85d
+  ✅ donchian_20_RR_1:3_bidir                   n= 119 PF=1.46 R=+0.33 DD=9.7% recov=126d
+  ✅ donchian_20_RR_1:3_long                    n=  74 PF=1.21 R=+0.16 DD=5.7% recov=103d
+  ✅ donchian_55_RR_1:1_bidir                   n= 150 PF=1.20 R=+0.09 DD=3.1% recov=48d
+  ✅ donchian_55_RR_1:1_long                    n=  81 PF=1.17 R=+0.08 DD=2.4% recov=69d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  44 PF=1.13 R=+0.10 DD=3.7% recov=100d
+  ✅ rsi_20_80_RR_1:2_bidir                     n=  15 PF=1.86 R=+0.43 DD=1.4% recov=37d
+
+=== GER40.cash M15: 8,000 bars  0.36y ===
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  27 PF=1.21 R=+0.14 DD=1.8% recov=41d
+  ✅ donchian_55_RR_1:3_bidir                   n=  95 PF=1.06 R=+0.05 DD=5.1% recov=31d
+
+=== UK100.cash D1: 1,463 bars  8.35y ===
+  ✅ donchian_20_RR_1:1_long                    n=  33 PF=1.07 R=+0.03 DD=1.4% recov=113d
+  ✅ donchian_20_RR_1:2_long_+200ema            n=  21 PF=1.74 R=+0.39 DD=1.4% recov=171d
+
+=== UK100.cash H1: 8,000 bars  1.40y ===
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  52 PF=1.55 R=+0.38 DD=6.0% recov=143d
+  ✅ ema_cross_12_26_RR_1:2_long                n=  48 PF=1.26 R=+0.17 DD=2.4% recov=113d
+  ✅ ema_cross_12_26_RR_1:3_long                n=  41 PF=1.11 R=+0.09 DD=2.8% recov=53d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  29 PF=1.41 R=+0.29 DD=3.2% recov=72d
+
+=== UK100.cash M15: 8,000 bars  0.35y ===
+  ✅ ema_cross_9_20_RR_1:2_bidir                n=  90 PF=1.19 R=+0.12 DD=4.4% recov=56d
+
+=== XAUUSD D1: 2,000 bars  7.75y ===
+  ✅ donchian_55_RR_1:2_long                    n=  28 PF=2.33 R=+0.63 DD=1.4% recov=138d
+  ✅ donchian_55_RR_1:3_long                    n=  22 PF=2.72 R=+0.92 DD=1.6% recov=21d
+  ✅ donchian_55_RR_1:2_long_+200ema            n=  28 PF=2.33 R=+0.63 DD=1.4% recov=138d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  22 PF=2.72 R=+0.92 DD=1.6% recov=21d
+
+=== XAUUSD H1: 8,029 bars  1.36y ===
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  53 PF=1.15 R=+0.13 DD=5.5% recov=152d
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  28 PF=1.15 R=+0.10 DD=4.0% recov=161d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  27 PF=1.33 R=+0.25 DD=4.3% recov=46d
+  ✅ donchian_55_RR_1:1_long                    n=  81 PF=1.11 R=+0.06 DD=3.7% recov=49d
+  ✅ donchian_55_RR_1:2_bidir                   n= 106 PF=1.09 R=+0.05 DD=4.2% recov=40d
+  ✅ donchian_55_RR_1:2_long                    n=  61 PF=1.07 R=+0.05 DD=3.6% recov=18d
+  ✅ donchian_55_RR_1:3_bidir                   n=  87 PF=1.27 R=+0.21 DD=4.2% recov=44d
+  ✅ donchian_55_RR_1:3_long                    n=  51 PF=1.45 R=+0.33 DD=3.0% recov=6d
+  ✅ donchian_55_RR_1:2_long_+200ema            n=  57 PF=1.20 R=+0.13 DD=3.6% recov=18d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  47 PF=1.65 R=+0.45 DD=3.0% recov=6d
+
+=== XAUUSD M15: 8,000 bars  0.34y ===
+  ✅ donchian_55_RR_1:3_bidir                   n=  97 PF=1.14 R=+0.11 DD=6.7% recov=16d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  37 PF=1.30 R=+0.22 DD=3.9% recov=2d
+  ✅ rsi_25_75_RR_1:2_long                      n=  25 PF=1.18 R=+0.12 DD=2.7% recov=32d
+  ✅ rsi_20_80_RR_1:2_bidir                     n=  19 PF=1.58 R=+0.34 DD=2.6% recov=22d
+
+=== XAGUSD D1: 2,000 bars  7.75y ===
+  ✅ donchian_55_RR_1:1_long                    n=  35 PF=1.18 R=+0.12 DD=1.8% recov=115d
+
+=== XAGUSD H1: 8,000 bars  1.36y ===
+  ✅ ema_cross_9_20_RR_1:2_long                 n=  61 PF=1.42 R=+0.25 DD=5.1% recov=155d
+  ✅ ema_cross_9_20_RR_1:3_long                 n=  53 PF=1.45 R=+0.28 DD=4.0% recov=136d
+  ✅ ema_cross_12_26_RR_1:1_long                n=  47 PF=1.05 R=+0.03 DD=2.7% recov=99d
+  ✅ ema_cross_12_26_RR_1:2_bidir               n=  74 PF=1.25 R=+0.14 DD=4.9% recov=94d
+  ✅ ema_cross_12_26_RR_1:2_long                n=  46 PF=1.54 R=+0.29 DD=3.4% recov=34d
+  ✅ ema_cross_12_26_RR_1:3_long                n=  45 PF=1.79 R=+0.43 DD=4.4% recov=109d
+  ✅ ema_cross_12_26_RR_1:2_long_+200ema        n=  26 PF=1.54 R=+0.30 DD=3.4% recov=114d
+  ✅ ema_cross_12_26_RR_1:3_long_+200ema        n=  26 PF=1.81 R=+0.46 DD=3.9% recov=58d
+  ✅ donchian_20_RR_1:3_long                    n=  79 PF=1.43 R=+0.29 DD=6.6% recov=72d
+  ✅ donchian_20_RR_1:3_long_+200ema            n=  61 PF=1.39 R=+0.26 DD=7.7% recov=93d
+  ✅ donchian_55_RR_1:2_long                    n=  73 PF=1.15 R=+0.07 DD=4.9% recov=49d
+  ✅ donchian_55_RR_1:3_long                    n=  61 PF=1.18 R=+0.14 DD=3.4% recov=46d
+  ✅ donchian_55_RR_1:2_long_+200ema            n=  64 PF=1.41 R=+0.23 DD=4.6% recov=46d
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  51 PF=1.42 R=+0.30 DD=2.7% recov=30d
+
+=== XAGUSD M15: 8,000 bars  0.34y ===
+  ✅ ema_cross_9_20_RR_1:2_bidir                n=  98 PF=1.08 R=+0.05 DD=5.0% recov=14d
+  ✅ ema_cross_9_20_RR_1:3_bidir                n=  79 PF=1.05 R=+0.03 DD=5.4% recov=10d
+  ✅ donchian_20_RR_1:3_bidir                   n= 108 PF=1.13 R=+0.10 DD=4.5% recov=17d
+  ✅ rsi_20_80_RR_1:1_bidir                     n=  18 PF=1.35 R=+0.14 DD=1.1% recov=7d
+
+=== XPDUSD D1: 2,000 bars  7.75y ===
+
+=== XPDUSD H1: 8,029 bars  1.36y ===
+  ✅ rsi_30_70_RR_1:1_long                      n=  32 PF=1.28 R=+0.11 DD=1.3% recov=52d
+  ✅ rsi_30_70_RR_1:2_long                      n=  31 PF=1.49 R=+0.28 DD=2.8% recov=52d
+
+=== XPDUSD M15: 8,000 bars  0.34y ===
+  ✅ rsi_25_75_RR_1:1_bidir                     n=  26 PF=1.58 R=+0.23 DD=3.5% recov=85d
+  ✅ rsi_25_75_RR_1:2_bidir                     n=  26 PF=1.30 R=+0.19 DD=4.0% recov=65d
+
+=== XPTUSD D1: 2,000 bars  7.75y ===
+
+=== XPTUSD H1: 8,000 bars  1.36y ===
+  ✅ donchian_55_RR_1:3_long_+200ema            n=  57 PF=1.14 R=+0.10 DD=4.5% recov=21d
+
+=== XPTUSD M15: 8,000 bars  0.34y ===
+
+==============================================================================================================
+FULL SWEEP COMPLETE — 123 of 1638 cells passed OOS gate
+==============================================================================================================
+Ticker       TF   Variant                                          n    PF      R   DD%   recov
+  XAUUSD     D1   donchian_55_RR_1:3_long                         22  2.72  +0.92  1.6%     21d
+  XAUUSD     D1   donchian_55_RR_1:3_long_+200ema                 22  2.72  +0.92  1.6%     21d
+  GER40.cash D1   donchian_20_RR_1:3_long_+200ema                 17  2.17  +0.68  1.6%    119d
+  XAUUSD     D1   donchian_55_RR_1:2_long                         28  2.33  +0.63  1.4%    138d
+  XAUUSD     D1   donchian_55_RR_1:2_long_+200ema                 28  2.33  +0.63  1.4%    138d
+  HK50.cash  M15  ema_cross_12_26_RR_1:2_long_+200ema             19  1.92  +0.51 13.3%      6d
+  US100.cash D1   donchian_20_RR_1:2_long_+200ema                 19  1.95  +0.50  1.7%     77d
+  US500.cash H1   rsi_25_75_RR_1:2_long                           19  1.96  +0.50  1.8%     21d
+  US100.cash D1   donchian_20_RR_1:3_long_+200ema                 16  1.84  +0.52  1.9%    122d
+  US30.cash  H1   donchian_55_RR_1:3_long_+200ema                 38  1.74  +0.50  5.9%    175d
+  XAGUSD     H1   ema_cross_12_26_RR_1:3_long_+200ema             26  1.81  +0.46  3.9%     58d
+  GER40.cash H1   rsi_20_80_RR_1:2_bidir                          15  1.86  +0.43  1.4%     37d
+  HK50.cash  H1   ema_cross_12_26_RR_1:2_long_+200ema             26  1.81  +0.43 14.5%     44d
+  XAGUSD     H1   ema_cross_12_26_RR_1:3_long                     45  1.79  +0.43  4.4%    109d
+  HK50.cash  M15  ema_cross_12_26_RR_1:2_long                     42  1.73  +0.43 28.1%     32d
+  XAUUSD     H1   donchian_55_RR_1:3_long_+200ema                 47  1.65  +0.45  3.0%      6d
+  JP225.cash M15  ema_cross_9_20_RR_1:3_long                      54  1.69  +0.41 67.4%     29d
+  HK50.cash  M15  ema_cross_12_26_RR_1:2_bidir                    78  1.74  +0.39 31.1%     61d
+  UK100.cash D1   donchian_20_RR_1:2_long_+200ema                 21  1.74  +0.39  1.4%    171d
+  US100.cash M15  ema_cross_9_20_RR_1:2_long                      49  1.72  +0.39  5.9%     32d
+  HK50.cash  M15  ema_cross_12_26_RR_1:3_long_+200ema             19  1.51  +0.41 21.4%      4d
+  UK100.cash H1   ema_cross_9_20_RR_1:3_long                      52  1.55  +0.38  6.0%    143d
+  US100.cash D1   donchian_55_RR_1:1_long                         23  1.89  +0.29  1.0%     84d
+  HK50.cash  H1   ema_cross_12_26_RR_1:3_long_+200ema             25  1.49  +0.37 13.6%     46d
+  XAUUSD     M15  rsi_20_80_RR_1:2_bidir                          19  1.58  +0.34  2.6%     22d
+  JP225.cash M15  ema_cross_9_20_RR_1:2_long                      62  1.54  +0.34 54.5%     21d
+  US100.cash H1   donchian_55_RR_1:3_long                         45  1.49  +0.34  5.9%     34d
+  US100.cash M15  donchian_20_RR_1:2_long                         92  1.56  +0.32  6.1%     36d
+  US500.cash M15  donchian_20_RR_1:2_long_+200ema                 74  1.56  +0.31  3.3%      8d
+  US100.cash M15  donchian_20_RR_1:2_long_+200ema                 84  1.54  +0.31  6.0%     29d

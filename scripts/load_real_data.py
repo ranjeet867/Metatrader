@@ -30,13 +30,30 @@ def main() -> int:
                     help="Number of bars to fetch (broker may cap)")
     ap.add_argument("--out", default=None,
                     help="Output parquet path (default: data/<ticker>_<tf>.parquet)")
+    ap.add_argument("--timeout", type=float, default=120.0,
+                    help="Bridge timeout (s). Default 120 (was 30); bump "
+                          "to 300+ for >50k bars — MT5 takes ~1s per 1000 "
+                          "M15 bars to serialize.")
     args = ap.parse_args()
 
     out = Path(args.out) if args.out else \
           ROOT / "data" / f"{args.ticker}_{args.tf}.parquet"
 
-    print(f"Fetching {args.ticker} {args.tf} ({args.bars} bars) via MT5 bridge...")
-    df = fetch_from_bridge(args.ticker, args.tf, args.bars)
+    # Safety cap: large requests can crash the Wine MT5 bridge EA.
+    # Empirically 5000-bar requests are reliable; 30k+ tends to hang
+    # the EA and leave it in zombie state. Force chunked fetch above
+    # 8000 bars or warn the user.
+    SAFE_CAP = 8000
+    if args.bars > SAFE_CAP:
+        print(f"⚠️  WARNING: requesting {args.bars} bars in a single call.")
+        print(f"   Wine MT5 bridge can crash the EA above ~{SAFE_CAP} bars.")
+        print(f"   If the EA stops responding after this, restart MT5.")
+        print(f"   Consider --bars {SAFE_CAP} for safer behaviour.")
+
+    print(f"Fetching {args.ticker} {args.tf} ({args.bars} bars, "
+          f"timeout={args.timeout}s) via MT5 bridge...")
+    df = fetch_from_bridge(args.ticker, args.tf, args.bars,
+                            timeout_s=args.timeout)
     print(f"  Got {len(df)} candles  "
           f"first={df['time'].iloc[0]}  "
           f"last={df['time'].iloc[-1]}")

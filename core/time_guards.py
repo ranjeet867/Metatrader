@@ -28,13 +28,28 @@ from core.asset_class import classify
 @dataclass(frozen=True)
 class TimeGuardCfg:
     """Subset of risk_config used by time_guards. Decouples from the full
-    RiskConfig — the executor / runner / paper_loop pass this in."""
+    RiskConfig — the executor / runner / paper_loop pass this in.
+
+    The `enforce_daily_flat` flag mirrors `run_backtest`'s opt-in for
+    daily-close behaviour. Pre-fix paper_executor would fire daily-flat
+    whenever `daily_close_flat_classes` was non-empty, but `run_backtest`
+    only fired daily-flat when its `enforce_daily_flat` arg was True.
+    Replay using TimeGuardCfg directly could thus DIVERGE from backtest
+    on stocks/indices when a caller set `weekend_flat_all=True` without
+    intending daily-flat behaviour. Now both engines gate on this flag.
+
+    Default True preserves existing live/paper behaviour. Replay paths
+    that build TimeGuardCfg from a backtest's flag should pass the
+    actual enforce_daily_flat value through (or use
+    `time_guard_cfg_from_risk_config(... enforce_daily_flat=...)`).
+    """
     weekend_flat_all: bool
     daily_close_flat_classes: tuple[str, ...]
     us_session_close_hhmm: str            # "HH:MM" UTC
     flat_buffer_minutes: int
     no_entry_minutes_before_close: int
     asset_class_overrides: dict[str, Iterable[str]] | None = None
+    enforce_daily_flat: bool = True       # NEW — gate daily-flat firing
 
 
 def _parse_hhmm(s: str) -> time:

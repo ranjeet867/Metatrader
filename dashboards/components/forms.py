@@ -28,18 +28,42 @@ def render_params_form(params_cls: type, key_prefix: str) -> Any:
                 resolved = type(default) if default is not dataclasses.MISSING else str
 
         label = f.name.replace("_", " ")
+        # Streamlit constraint: when a session_state value is pre-set
+        # under the widget's key (e.g. by a URL deep-link prefill in
+        # 1_📊_Backtest.py setting `bt_p_{base}__{field}`), passing
+        # `value=` to the widget triggers the "default + session_state"
+        # warning. To support both code paths cleanly:
+        #   - if the key is already in session_state, OMIT value= and
+        #     let session_state drive the initial render
+        #   - otherwise, pass value=default as before
+        prefilled = widget_key in st.session_state
+
         if resolved is bool:
-            field_values[f.name] = st.checkbox(label, value=bool(default),
-                                                  key=widget_key)
+            if prefilled:
+                field_values[f.name] = st.checkbox(label, key=widget_key)
+            else:
+                field_values[f.name] = st.checkbox(
+                    label, value=bool(default), key=widget_key)
         elif resolved is int:
-            field_values[f.name] = int(st.number_input(label, value=int(default),
-                                                          step=1, key=widget_key))
+            if prefilled:
+                field_values[f.name] = int(st.number_input(
+                    label, step=1, key=widget_key))
+            else:
+                field_values[f.name] = int(st.number_input(
+                    label, value=int(default), step=1, key=widget_key))
         elif resolved is float:
             step = max(abs(float(default)) * 0.1, 0.01) if default else 0.1
-            field_values[f.name] = float(st.number_input(label, value=float(default),
-                                                            step=step, format="%.4f",
-                                                            key=widget_key))
+            if prefilled:
+                field_values[f.name] = float(st.number_input(
+                    label, step=step, format="%.4f", key=widget_key))
+            else:
+                field_values[f.name] = float(st.number_input(
+                    label, value=float(default), step=step,
+                    format="%.4f", key=widget_key))
         else:
-            field_values[f.name] = st.text_input(label, value=str(default),
-                                                    key=widget_key)
+            if prefilled:
+                field_values[f.name] = st.text_input(label, key=widget_key)
+            else:
+                field_values[f.name] = st.text_input(
+                    label, value=str(default), key=widget_key)
     return params_cls(**field_values)

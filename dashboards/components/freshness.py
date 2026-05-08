@@ -76,5 +76,5 @@ def render_freshness_bar(data_index: dict[str, dict[str, Path]]) -> None:
         emoji_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
         df["age"] = df["bucket"].map(emoji_map) + " " + df["age_days"].astype(str) + "d"
         st.dataframe(df[["ticker", "tf", "modified_utc", "age"]],
-                      use_container_width=True,
+                      width="stretch",
                       height=min(360, 36 * (len(rows) + 1)))

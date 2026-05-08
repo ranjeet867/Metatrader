@@ -41,6 +41,173 @@ def _money(v: float, sign: bool = False) -> str:
     return ("${:+,.2f}" if sign else "${:,.2f}").format(v)
 
 
+def _resolve_base_strategy(variant_name: str, registered: dict) -> str | None:
+    """Thin shim around the shared resolver in strategy_resolver.py."""
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+    return resolve_base_strategy(variant_name, registered)
+
+
+def _decode_variant_and_rr_inline(*, variant: str, rr_label: str) -> dict:
+    """Reconstruct strategy params from a legacy markdown catalog row
+    (variant + R:R label only). Mirrors the same decoder in the Library
+    page — duplicated here to avoid cross-page imports across the
+    Streamlit page boundary. Tests live in
+    tests/test_library_legacy_decoder.py for both copies."""
+    cfg: dict = {}
+    if variant.startswith("ema_cross_"):
+        parts = variant.split("_")
+        if len(parts) >= 4:
+            try:
+                cfg["fast_period"] = int(parts[2])
+                cfg["slow_period"] = int(parts[3])
+            except ValueError:
+                pass
+    elif variant.startswith("ema_pullback_"):
+        parts = variant.split("_")
+        if len(parts) >= 4:
+            try:
+                cfg["fast_period"] = int(parts[2])
+                cfg["slow_period"] = int(parts[3])
+            except ValueError:
+                pass
+    elif variant.startswith("donchian_"):
+        try:
+            cfg["period"] = int(variant.split("_")[1])
+        except (ValueError, IndexError):
+            pass
+    elif variant.startswith("rsi_"):
+        parts = variant.split("_")
+        if len(parts) >= 3:
+            try:
+                cfg["oversold"] = int(parts[1])
+                cfg["overbought"] = int(parts[2])
+            except ValueError:
+                pass
+    elif variant.startswith("bbands_"):
+        parts = variant.split("_")
+        if len(parts) >= 3:
+            try:
+                cfg["bb_period"] = int(parts[1])
+                cfg["bb_k"] = float(parts[2])
+            except ValueError:
+                pass
+    rr_table = {
+        "1:1":      (1.5, 1.5),
+        "1:1.5":    (1.5, 2.25),
+        "1:2":      (1.5, 3.0),
+        "1:3":      (1.5, 4.5),
+        "1:2 wide": (2.5, 5.0),
+        "1:1.1":    (1.5, 1.65),
+    }
+    if rr_label and rr_label in rr_table:
+        sm, tm = rr_table[rr_label]
+        cfg["stop_atr_mult"] = sm
+        cfg["target_atr_mult"] = tm
+    return cfg
+
+
+def _run_parity_inline_for_dep(dep: Deployment, parity_gate) -> None:
+    """Run replay-parity for this deployment's strategy on its
+    ticker/tf. Records the pass to the parity gate. Shows a toast
+    + stores result in session for the dialog to display on rerun."""
+    import time
+    from core.config import load_config
+    from core.data import load_parquet
+    from core.parity_check import run_parity
+    from core.symbol_info_loader import try_load as try_load_symbol_info
+    from dashboards.components.state import (
+        DEFAULT_LOTS, DEFAULT_MONEY_PER_UNIT, resolve_money_per_unit, discover_strategies,
+    )
+
+    REPO = Path(__file__).resolve().parents[2]
+    parquet = REPO / "data" / f"{dep.ticker}_{dep.tf}.parquet"
+    if not parquet.exists():
+        st.error(f"⛔ No parquet for `{dep.ticker}` `{dep.tf}` — "
+                  f"can't run parity. Use Data Manager to fetch.")
+        return
+
+    strategies = discover_strategies()
+    base = _resolve_base_strategy(dep.strategy, strategies)
+    if base is None:
+        st.error(f"⛔ Strategy `{dep.strategy}` not registered. "
+                  f"Registered: {sorted(strategies.keys())}")
+        return
+
+    StratCls, ParamsCls = strategies[base]
+    # Reproduce the catalog cell's exact config so parity tests the
+    # ACTUAL deployed strategy, not a default-params version. Mirrors
+    # the same fix applied to the Backtest popup + Library deep-dive.
+    import dataclasses as _dc
+    import json as _json
+    from core import edge_catalog as _ec
+    stored_cfg: dict = {}
+    edge_row = _ec.best_for(dep.ticker, dep.tf, dep.strategy)
+    if edge_row is not None:
+        cfg_json = getattr(edge_row, "source_config_json", "") or ""
+        if cfg_json:
+            try:
+                stored_cfg = _json.loads(cfg_json)
+            except (ValueError, TypeError):
+                stored_cfg = {}
+        if not stored_cfg:
+            stored_cfg = _decode_variant_and_rr_inline(
+                variant=dep.strategy,
+                rr_label=getattr(edge_row, "rr_label", ""),
+            )
+    try:
+        if ParamsCls is None:
+            strat = StratCls()
+        else:
+            field_names = {f.name for f in _dc.fields(ParamsCls)}
+            kwargs = {k: v for k, v in stored_cfg.items()
+                       if k in field_names}
+            if "long_only" in field_names:
+                kwargs["long_only"] = dep.long_only
+            strat = StratCls(ParamsCls(**kwargs))
+    except Exception as e:
+        st.error(f"⛔ Could not instantiate strategy: {e}")
+        return
+
+    cfg = load_config()
+    df = load_parquet(parquet)
+    sym_info = try_load_symbol_info(dep.ticker)
+    # Use cost_defaults for the parity run — same constants every other
+    # backtest entry point uses, so divergence between BT and Replay
+    # measures REAL engine drift, not config drift.
+    from core import cost_defaults as _cd
+
+    t0 = time.time()
+    with st.spinner(f"Running parity for {base} × {dep.ticker} × {dep.tf}..."):
+        pr = run_parity(
+            df, strat, symbol=dep.ticker, tf=dep.tf,
+            starting_balance=_cd.DEFAULT_STARTING_BALANCE_USD,
+            lots=0.1,        # ignored when risk_pct + symbol_info present
+            money_per_unit_price=resolve_money_per_unit(dep.ticker),
+            commission_per_trade=_cd.DEFAULT_COMMISSION_USD,
+            slippage_per_fill_atr_frac=_cd.DEFAULT_SLIPPAGE_ATR_FRAC,
+            risk_cfg=cfg, symbol_info=sym_info,
+            risk_pct=(_cd.DEFAULT_RISK_PCT if sym_info is not None
+                       else None),
+        )
+    elapsed = time.time() - t0
+    bt, rp, div = pr.bt, pr.rp, pr.divergence_dollars
+    if div < 0.01:
+        parity_gate.record_pass(base, divergence_dollars=div)
+        st.success(
+            f"✅ Parity PASSED in {elapsed:.2f}s — divergence ${div:.6f}. "
+            f"`{base}` is now cleared for live deployment for 24h."
+        )
+        st.toast(f"✅ {base} parity recorded")
+    else:
+        st.error(
+            f"⛔ Parity FAILED — divergence ${div:.4f} > $0.01 tolerance. "
+            f"BT: {bt.n_trades} trades / ${bt.sum_realized_pnl:+,.2f}, "
+            f"Replay: {rp.n_trades} trades / ${rp.sum_realized_pnl:+,.2f}. "
+            f"`{base}` BLOCKED from live until engine drift is fixed."
+        )
+        st.toast(f"⛔ {base} parity FAILED ${div:.2f} divergence", icon="⛔")
+
+
 # ---------------------------------------------------------------------------
 # Backtest dialog — runs the backtest inline and shows results
 # ---------------------------------------------------------------------------
@@ -83,30 +250,40 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
     # User picks the simulated starting balance so the curve reads as
     # 'what would $100k have looked like'. Real backtest still runs at
     # 100k internally; we rescale only for display.
+    # Defaults pulled from core.cost_defaults — same values the catalog
+    # rows + Composer + Library + standalone Backtest page all use, so
+    # this popup's metrics are directly comparable.
+    from core import cost_defaults as _cd
     cols_input = st.columns([1, 1, 1])
     start_bal = float(cols_input[0].number_input(
-        "Starting balance ($)", value=100_000.0, step=10_000.0,
-        min_value=1_000.0, max_value=10_000_000.0,
+        "Starting balance ($)",
+        value=_cd.DEFAULT_STARTING_BALANCE_USD,
+        step=10_000.0, min_value=1_000.0, max_value=10_000_000.0,
         key=f"bt_startbal_{dep.deployment_id}",
     ))
     train_pct = float(cols_input[1].slider(
-        "Train split %", min_value=0.5, max_value=0.9, value=0.6, step=0.05,
+        "Train split %", min_value=0.5, max_value=0.9,
+        value=_cd.DEFAULT_TRAIN_PCT, step=0.05,
         key=f"bt_train_{dep.deployment_id}",
     ))
     commission = float(cols_input[2].number_input(
-        "Commission $/trade", value=3.0, step=0.5, min_value=0.0,
-        max_value=20.0, key=f"bt_comm_{dep.deployment_id}",
+        "Commission $/trade",
+        value=_cd.DEFAULT_COMMISSION_USD, step=0.5,
+        min_value=0.0, max_value=20.0,
+        key=f"bt_comm_{dep.deployment_id}",
     ))
 
     strats = discover_strategies()
-    base = dep.strategy
-    for needle in ("_9_20", "_12_26", "_20_50", "_30_70",
-                    "_20_2", "_55", "_20", "_10"):
-        if base.endswith(needle):
-            base = base[: -len(needle)]
-            break
+    # Use the SHARED variant→base resolver — pre-fix this dialog had its
+    # own ad-hoc suffix-stripper that mapped 'rsi_30_70' → 'rsi' (which
+    # doesn't exist in the registry; the real base is 'rsi_meanrev').
+    # Same pattern broke for any variant where the base name isn't just
+    # the variant minus the suffix.
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+    base = resolve_base_strategy(dep.strategy, strats) or dep.strategy
     if base not in strats:
-        st.error(f"Strategy class `{base}` not in registry.")
+        st.error(f"Strategy class `{base}` not in registry "
+                 f"(variant `{dep.strategy}` could not be resolved).")
         if st.button("Close", key=f"bt_close2_{dep.deployment_id}"):
             clear_dialog()
             st.rerun()
@@ -114,11 +291,51 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
 
     StratCls, ParamsCls = strats[base]
 
+    # Reproduce the catalog metrics: pull source_config_json (v2.db) or
+    # decode from variant + R:R label (legacy markdown). Without this
+    # the popup runs with strategy defaults — produces totally different
+    # trade counts than the deployment card claims.
+    import dataclasses as _dc
+    import json as _json
+    from core import edge_catalog as _ec
+    from core.symbol_info_loader import try_load as _try_load_si
+    from dashboards.components.state import (
+        resolve_money_per_unit as _resolve_mpu,
+    )
+    stored_cfg: dict = {}
+    edge_row = _ec.best_for(dep.ticker, dep.tf, dep.strategy)
+    if edge_row is not None:
+        cfg_json = getattr(edge_row, "source_config_json", "") or ""
+        if cfg_json:
+            try:
+                stored_cfg = _json.loads(cfg_json)
+            except (ValueError, TypeError):
+                stored_cfg = {}
+        if not stored_cfg:
+            # Legacy markdown row — decode variant + R:R label
+            stored_cfg = _decode_variant_and_rr_inline(
+                variant=dep.strategy,
+                rr_label=getattr(edge_row, "rr_label", ""),
+            )
+
+    # Symbol_info is REQUIRED for risk%-sizing to match the catalog.
+    # Pre-fix the popup ran with fixed lots=0.1, which on a $1/unit
+    # index like UK100.cash produces $10 avg trades — vs the catalog's
+    # ~$300 avg trades from rebaseline_catalog using risk_pct=0.30%.
+    # That's why the popup shows PF 0.66 while the deployment card
+    # claims PF 1.54 — same trades, different sizing → different stats.
+    sym_info = _try_load_si(dep.ticker)
+
     with st.spinner("Loading parquet + running backtest…"):
         df = load_parquet(parquet)
         if ParamsCls is not None:
+            field_names = {f.name for f in _dc.fields(ParamsCls)}
+            kwargs = {k: v for k, v in stored_cfg.items()
+                       if k in field_names}
+            if "long_only" in field_names:
+                kwargs["long_only"] = dep.long_only
             try:
-                strat = StratCls(ParamsCls(long_only=dep.long_only))
+                strat = StratCls(ParamsCls(**kwargs))
             except TypeError:
                 strat = StratCls()
         else:
@@ -126,12 +343,27 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
         result = run_backtest(
             df, strat.signals(df),
             starting_balance=start_bal,
-            lots=1.0, money_per_unit_price=1.0,
+            # When sym_info is available, risk_pct drives sizing — lots
+            # is ignored. When sym_info is missing (rare), fall back to
+            # 0.1 lots so the run completes (with a divergent sizing
+            # warning in the UI).
+            lots=0.1,
+            money_per_unit_price=_resolve_mpu(dep.ticker),
             commission_per_trade=commission,
-            slippage_per_fill_atr_frac=0.1,
+            slippage_per_fill_atr_frac=_cd.DEFAULT_SLIPPAGE_ATR_FRAC,
             symbol=dep.ticker,
+            risk_pct=(_cd.DEFAULT_RISK_PCT if sym_info is not None
+                       else None),
+            symbol_info=sym_info,
         )
         stats = compute_full_stats(result, starting_balance=start_bal)
+    if sym_info is None:
+        st.warning(
+            f"⚠ symbol_info missing for `{dep.ticker}` — popup ran "
+            f"with fixed 0.1 lots instead of risk%-sizing. Metrics "
+            f"will diverge from the catalog row. Run "
+            f"`make refresh-symbol-info` to fix."
+        )
 
     # Reconciliation
     if result.reconciles:
@@ -242,7 +474,7 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
             yaxis=dict(gridcolor="#1f2937", title="$"),
             hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # Drawdown sub-chart
         fig_dd = go.Figure()
@@ -260,7 +492,7 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
             xaxis=dict(gridcolor="#1f2937"),
             yaxis=dict(gridcolor="#1f2937"),
         )
-        st.plotly_chart(fig_dd, use_container_width=True)
+        st.plotly_chart(fig_dd, width="stretch")
 
     # ─── Train/test split ──────────────────────────────────────────────
     train, test = partition_train_test(result, train_pct, n_bars=len(df))
@@ -294,7 +526,7 @@ def backtest_dialog(*, dep: Deployment, login: int) -> None:
     )
 
     st.markdown("---")
-    if st.button("Close", use_container_width=True,
+    if st.button("Close", width="stretch",
                   key=f"bt_close3_{dep.deployment_id}"):
         clear_dialog()
         st.rerun()
@@ -354,8 +586,16 @@ def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
 
     # Pre-flight checks
     sentinel = Path(account_manager.EMERGENCY_STOP_FILE)
-    last_pass = parity_gate.last_pass_for(dep.strategy)
-    parity_ok = parity_gate.is_recent(dep.strategy, max_age_hours=24.0)
+    # CRITICAL: parity gate stores by BASE strategy name (e.g. rsi_meanrev),
+    # not the variant (rsi_30_70). Pre-fix this dialog read the gate with
+    # dep.strategy → no match → "no parity pass on record" forever, even
+    # after the user clicked "Run now" and it actually passed (recorded
+    # under the base). Resolve to base for the lookup.
+    from dashboards.components.state import discover_strategies as _ds
+    _strats_for_gate = _ds()
+    parity_base = _resolve_base_strategy(dep.strategy, _strats_for_gate) or dep.strategy
+    last_pass = parity_gate.last_pass_for(parity_base)
+    parity_ok = parity_gate.is_recent(parity_base, max_age_hours=24.0)
     daily_loss = risk_tracker.account_daily_loss_pct()
     in_win = in_no_entry_window(datetime.now(timezone.utc), time_guard_cfg)
     market_status = market_clock.status_for(dep.ticker)
@@ -367,7 +607,13 @@ def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
         (f"Daily loss < {cfg.daily_loss_cap_pct}% cap",
          daily_loss < cfg.daily_loss_cap_pct,
          f"current: {daily_loss:.2f}%"),
-        (f"Replay-parity for `{dep.strategy}` < 24h",
+        # Label uses base name + variant in parens — makes the key
+        # match transparent so the user can see WHY it's recording
+        # under e.g. `rsi_meanrev` rather than `rsi_30_70`.
+        (f"Replay-parity for `{parity_base}`"
+         + (f" (variant `{dep.strategy}`)"
+            if parity_base != dep.strategy else "")
+         + " < 24h",
          parity_ok,
          (f"last pass {last_pass[0].strftime('%Y-%m-%d %H:%M UTC')}, "
           f"div=${last_pass[1]:.4f}" if last_pass
@@ -390,7 +636,44 @@ def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
     st.markdown("##### Pre-flight checks")
     for label, ok, detail in checks:
         emoji = "✅" if ok else "⛔"
-        st.markdown(f"{emoji}  **{label}** — {detail}")
+        # Inline fix-buttons next to failing parity check
+        if not ok and "Replay-parity" in label:
+            row = st.columns([4, 1])
+            row[0].markdown(f"{emoji}  **{label}** — {detail}")
+            if row[1].button("🔬 Run now",
+                              key=f"gl_run_parity_{dep.deployment_id}",
+                              type="primary",
+                              width="stretch"):
+                _run_parity_inline_for_dep(dep, parity_gate)
+                st.rerun()
+        else:
+            st.markdown(f"{emoji}  **{label}** — {detail}")
+
+    # Quick action buttons even when all checks pass — let user re-verify
+    # backtest / parity right from the dialog without leaving.
+    st.markdown("---")
+    st.markdown("##### Quick actions")
+    qa = st.columns(3)
+    if qa[0].button("📊 Run backtest",
+                      key=f"gl_act_bt_{dep.deployment_id}",
+                      width="stretch",
+                      help="Open the backtest dialog for this cell."):
+        st.session_state[SS_DIALOG_KIND] = "backtest"
+        st.rerun()
+    if qa[1].button("🔬 Run replay-parity",
+                      key=f"gl_act_parity_{dep.deployment_id}",
+                      width="stretch",
+                      help="Re-record parity for this strategy "
+                            "(recommended weekly)."):
+        _run_parity_inline_for_dep(dep, parity_gate)
+        st.rerun()
+    if qa[2].button("👁 Open Replay-Parity page",
+                      key=f"gl_act_parity_page_{dep.deployment_id}",
+                      width="stretch"):
+        try:
+            st.switch_page("pages/B_🔬_Replay_Parity.py")
+        except Exception:
+            st.info("Use the sidebar → 🔬 Replay Parity page.")
 
     # Risk math
     st.markdown("##### Risk math")
@@ -424,7 +707,7 @@ def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
     if cols[0].button(
         "🚀  Deploy live",
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=(confirm != "DEPLOY"),
         key=f"gl_deploy_{dep.deployment_id}",
     ):
@@ -442,7 +725,7 @@ def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
         st.toast(f"🚀 LIVE: {dep.deployment_id}")
         clear_dialog()
         st.rerun()
-    if cols[1].button("Cancel", use_container_width=True,
+    if cols[1].button("Cancel", width="stretch",
                        key=f"gl_cancel_{dep.deployment_id}"):
         clear_dialog()
         st.rerun()
@@ -468,13 +751,13 @@ def remove_dialog(*, dep: Deployment, login: int) -> None:
         "removed from this account's portfolio list.")
     cols = st.columns([1, 1])
     if cols[0].button("🗑  Remove", type="primary",
-                       use_container_width=True,
+                       width="stretch",
                        key=f"rm_yes_{dep.deployment_id}"):
         dep_mod.remove_deployment(login, dep.deployment_id)
         st.toast(f"Removed {dep.deployment_id}")
         clear_dialog()
         st.rerun()
-    if cols[1].button("Cancel", use_container_width=True,
+    if cols[1].button("Cancel", width="stretch",
                        key=f"rm_no_{dep.deployment_id}"):
         clear_dialog()
         st.rerun()

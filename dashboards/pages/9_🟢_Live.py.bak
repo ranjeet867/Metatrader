@@ -1,0 +1,595 @@
+"""
+9_🟢_Live.py — dedicated LIVE trading page.
+
+Separate from Paper so actions can't be confused. Has its own pre-flight
+gate, per-deployment controls, and per-strategy live P&L analytics.
+
+Sections:
+  1. Pre-flight gate strip — daily-loss cap, EMERGENCY_STOP, no-entry win,
+     replay-parity recorded? — must all be GREEN before any deploy fires.
+  2. Headline KPIs — total live P&L, n strategies live, win rate.
+  3. Per-deployment cards (only those with status=live) — risk %, daily
+     cap, ⏸/⛔ HALT/Demote-to-paper buttons.
+  4. Promote new deployments — pulls from Strategy Library, with edge
+     stats inline.
+  5. Per-strategy live P&L bar chart.
+  6. Strategy equity curve via dropdown.
+"""
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from core import account_manager                                # noqa: E402
+from core import deployment as dep_mod                          # noqa: E402
+from core import perf_query                                     # noqa: E402
+from core.config import load_config                             # noqa: E402
+from core.parity_gate import ParityGate                         # noqa: E402
+from core.risk_engine import LiveRiskTracker                    # noqa: E402
+from core.time_guards import (                                   # noqa: E402
+    in_no_entry_window, time_guard_cfg_from_risk_config,
+)
+from dashboards.components import theme                         # noqa: E402
+
+DB_PATH = REPO / "data" / "v2.db"
+MODE = "live"
+
+
+def _status_pill(status: str) -> str:
+    style = {
+        "idle":   ("#374151", "⚪ IDLE"),
+        "paper":  ("#b08800", "🟡 PAPER"),
+        "live":   ("#15803d", "🟢 LIVE"),
+        "paused": ("#7c2d12", "⏸ PAUSED"),
+        "halted": ("#7f1d1d", "⛔ HALTED"),
+    }.get(status, ("#374151", status.upper()))
+    color, label = style
+    return (f"<span style='display:inline-block;background:{color};"
+             f"color:white;padding:2px 8px;border-radius:10px;"
+             f"font-size:0.72rem;font-weight:600;letter-spacing:0.05em;'>"
+             f"{label}</span>")
+
+
+def _render_preflight(cfg) -> tuple[bool, list[tuple[str, bool, str]]]:
+    """Returns (all_green, [(label, ok, hint), ...])."""
+    sentinel = REPO / "data" / "EMERGENCY_STOP"
+    tracker = LiveRiskTracker(db_path=DB_PATH,
+                                daily_loss_cap_pct=cfg.daily_loss_cap_pct)
+    daily = tracker.account_daily_loss_pct()
+    tg_cfg = time_guard_cfg_from_risk_config(cfg)
+    in_win = in_no_entry_window(datetime.now(timezone.utc), tg_cfg)
+    checks = [
+        ("EMERGENCY_STOP absent",
+         not sentinel.exists(),
+         "Clear data/EMERGENCY_STOP via Operations page → Settings."),
+        (f"Daily loss < {cfg.daily_loss_cap_pct}% cap "
+         f"(now {daily:.2f}%)",
+         daily < cfg.daily_loss_cap_pct,
+         "Wait until tomorrow's reset or close losing positions."),
+        ("Outside no-entry window",
+         not in_win,
+         "Currently inside the daily flat window — wait for the next "
+         "session open."),
+    ]
+    all_green = all(ok for _, ok, _ in checks)
+    return all_green, checks
+
+
+def _render_preflight_strip(checks: list[tuple[str, bool, str]],
+                              all_green: bool) -> None:
+    n_ok = sum(1 for _, ok, _ in checks if ok)
+    n_total = len(checks)
+    color = "#15803d" if all_green else "#b08800" if n_ok >= n_total - 1 else "#7f1d1d"
+    label = (f"All checks ✅ ({n_ok}/{n_total}) — live trading allowed"
+              if all_green
+              else f"⚠ {n_total - n_ok} check(s) failing ({n_ok}/{n_total}) "
+                    f"— live blocked")
+    st.markdown(
+        f"<div style='display:inline-block;background:{color};color:white;"
+        f"padding:8px 16px;border-radius:14px;font-weight:700;"
+        f"font-family:ui-monospace,Menlo,monospace;'>{label}</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Pre-flight details", expanded=not all_green):
+        for desc, ok, hint in checks:
+            mark = "✅" if ok else "⛔"
+            st.markdown(f"{mark} **{desc}**" + ("" if ok else f" — {hint}"))
+
+
+def _render_headline(account, summary: dict) -> None:
+    cols = st.columns(5)
+    cols[0].metric("Account", f"#{account.login}", help=account.alias)
+    cols[1].metric("Live P&L (all-time)",
+                      f"${summary['total_pnl']:+,.2f}")
+    cols[2].metric("Closed live trades", summary["n_trades"])
+    cols[3].metric("Win rate", f"{summary['win_rate_pct']:.1f}%")
+    cols[4].metric("Strategies live",
+                      f"{summary['n_strategies']}",
+                      help=f"{summary['n_winners']} profitable / "
+                            f"{summary['n_losers']} losing")
+
+
+@st.dialog("Replay-parity", width="large")
+def _render_live_parity_dialog(target: dict) -> None:
+    """Run replay-parity for the targeted variant inline. PASS records
+    to the gate and clears the target. FAIL stays open with the diagnosis.
+    """
+    import time
+    from core.config import load_config
+    from core.data import load_parquet
+    from core.parity_check import run_parity
+    from core.symbol_info_loader import try_load as try_load_symbol_info
+    from dashboards.components.state import (
+        DEFAULT_LOTS, DEFAULT_MONEY_PER_UNIT, discover_strategies,
+    )
+
+    variant = target["variant"]
+    base = target["base"]
+    ticker = target["ticker"]
+    tf = target["tf"]
+    long_only = target.get("long_only", True)
+
+    st.markdown(
+        f"### `{variant}`  ×  `{ticker}`  `{tf}`  "
+        f"({'long-only' if long_only else 'bidir'})"
+    )
+    st.caption(
+        f"Resolved base strategy: **`{base}`** — parity recorded under "
+        f"this name.  Threshold: divergence < $0.01."
+    )
+
+    strategies = discover_strategies()
+    if base not in strategies:
+        st.error(
+            f"⛔ Base strategy `{base}` is not registered. Registered: "
+            f"{sorted(strategies.keys())}"
+        )
+        if st.button("Close", use_container_width=True):
+            st.session_state.pop("_lv_parity_target", None)
+            st.rerun()
+        return
+
+    parquet = REPO / "data" / f"{ticker}_{tf}.parquet"
+    if not parquet.exists():
+        st.error(
+            f"⛔ No parquet for `{ticker}` `{tf}` — run Data Manager "
+            f"first to fetch."
+        )
+        if st.button("Close", use_container_width=True):
+            st.session_state.pop("_lv_parity_target", None)
+            st.rerun()
+        return
+
+    StratCls, ParamsCls = strategies[base]
+    try:
+        strat = StratCls() if ParamsCls is None else StratCls(ParamsCls())
+    except Exception as e:
+        st.error(f"⛔ Could not instantiate strategy: {e}")
+        if st.button("Close", use_container_width=True):
+            st.session_state.pop("_lv_parity_target", None)
+            st.rerun()
+        return
+
+    # Run inline
+    cfg = load_config()
+    df = load_parquet(parquet)
+    sym_info = try_load_symbol_info(ticker)
+    t0 = time.time()
+    with st.spinner(f"Running parity for {base} × {ticker} × {tf}..."):
+        pr = run_parity(
+            df, strat, symbol=ticker, tf=tf,
+            starting_balance=100_000,
+            lots=DEFAULT_LOTS.get(ticker, 0.1),
+            money_per_unit_price=resolve_money_per_unit(ticker),
+            commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+            risk_cfg=cfg, symbol_info=sym_info,
+        )
+    elapsed = time.time() - t0
+    div = pr.divergence_dollars
+
+    # Result UI
+    cols = st.columns(4)
+    cols[0].metric("BT trades", pr.bt.n_trades)
+    cols[1].metric("Replay trades", pr.rp.n_trades)
+    cols[2].metric("BT P&L", f"${pr.bt.sum_realized_pnl:+,.2f}")
+    cols[3].metric("Divergence", f"${div:.4f}",
+                       delta_color="off")
+
+    if pr.passes:
+        ParityGate(DB_PATH).record_pass(base, divergence_dollars=div)
+        st.success(
+            f"✅ **Parity PASSED** in {elapsed:.2f}s.  "
+            f"`{base}` is cleared for live deployment for the next 24h."
+        )
+        st.toast(f"✅ {base} parity recorded — Live page will refresh")
+        # Clear the target so the dialog doesn't reopen on rerun
+        if st.button("Done", type="primary", use_container_width=True):
+            st.session_state.pop("_lv_parity_target", None)
+            st.rerun()
+    else:
+        st.error(
+            f"⛔ **Parity FAILED** — divergence ${div:.4f} > $0.01.  "
+            f"BT: {pr.bt.n_trades} trades / "
+            f"${pr.bt.sum_realized_pnl:+,.2f}  vs  "
+            f"Replay: {pr.rp.n_trades} trades / "
+            f"${pr.rp.sum_realized_pnl:+,.2f}.  "
+            f"`{base}` BLOCKED from live until engine drift is "
+            f"resolved — investigate replay engine or signal logic."
+        )
+        if st.button("Close", use_container_width=True):
+            st.session_state.pop("_lv_parity_target", None)
+            st.rerun()
+
+
+def _render_one_live_card(account, d, parity_passed: bool,
+                            base_strategy_name: str | None = None,
+                            broker_position=None) -> None:
+    """Render one running-deployment card.
+
+    `broker_position` is the BridgePosition currently held by this
+    deployment, or None if it's flat. Used to show the holding-badge
+    inline so the user knows whether the strategy is in a trade right
+    now or just waiting for the next signal.
+    """
+    base_strategy_name = base_strategy_name or d.strategy
+    with st.container(border=True):
+        head = st.columns([3, 1, 1, 1])
+        edge = " " + (
+            "✅" if parity_passed
+            else "<span style='color:#dc2626;font-weight:600'>"
+                 "⚠ NO PARITY</span>"
+        )
+        # Holding badge — answers "is this deployment in a trade right now?"
+        from dashboards.components.holding_badge import render_badge
+        holding_html = render_badge(d, [broker_position] if broker_position
+                                       else [])
+        head[0].markdown(
+            f"{_status_pill(d.status)}  "
+            f"&nbsp;**`{d.strategy}`**  ×  `{d.ticker}`  ×  `{d.tf}`  "
+            f"({'long-only' if d.long_only else 'bidir'}){edge}<br>"
+            f"&nbsp;&nbsp;{holding_html}",
+            unsafe_allow_html=True,
+        )
+        # Inline Run-parity affordance on the card itself when missing
+        if not parity_passed:
+            if head[0].button(
+                "🔬 Run parity now",
+                key=f"_lv_card_parity_{d.deployment_id}",
+                type="primary",
+            ):
+                st.session_state["_lv_parity_target"] = {
+                    "variant": d.strategy,
+                    "base": base_strategy_name,
+                    "ticker": d.ticker,
+                    "tf": d.tf,
+                    "long_only": d.long_only,
+                }
+                st.rerun()
+        new_risk = float(head[1].number_input(
+            "risk %", value=float(d.risk_pct),
+            min_value=0.05, max_value=2.0, step=0.05,
+            format="%.2f", key=f"lv_risk_{d.deployment_id}",
+        ))
+        new_cap = float(head[2].number_input(
+            "daily cap %", value=float(d.daily_cap_pct),
+            min_value=0.5, max_value=10.0, step=0.5,
+            format="%.1f", key=f"lv_cap_{d.deployment_id}",
+        ))
+        equity = account.effective_baseline_equity
+        risk_dollars = equity * new_risk / 100.0
+        head[3].markdown(
+            f"<div style='font-family:ui-monospace,Menlo,monospace;"
+            f"font-size:0.78rem;line-height:1.5;'>"
+            f"<span style='color:#9ca3af;'>$/trade</span> "
+            f"<b>${risk_dollars:,.0f}</b><br>"
+            f"<span style='color:#9ca3af;'>last started</span> "
+            f"{(d.last_started_at_utc or '—')[:16]}</div>",
+            unsafe_allow_html=True,
+        )
+        if (new_risk != d.risk_pct) or (new_cap != d.daily_cap_pct):
+            d.risk_pct = new_risk
+            d.daily_cap_pct = new_cap
+            dep_mod.upsert_deployment(account.login, d)
+
+        actions = st.columns(4)
+        if actions[0].button("⏸ Pause",
+                              key=f"lv_pause_{d.deployment_id}",
+                              use_container_width=True):
+            dep_mod.update_status(account.login, d.deployment_id, "paused")
+            st.rerun()
+        if actions[1].button("📡 Demote → paper",
+                              key=f"lv_demote_{d.deployment_id}",
+                              use_container_width=True):
+            dep_mod.update_status(account.login, d.deployment_id, "paper")
+            st.toast(f"{d.deployment_id} → paper")
+            st.rerun()
+        if actions[2].button("⛔ HALT",
+                              key=f"lv_halt_{d.deployment_id}",
+                              use_container_width=True, type="primary",
+                              help="Refuse new signals. Open positions "
+                                    "are NOT auto-closed — manage on "
+                                    "Operations page."):
+            dep_mod.update_status(account.login, d.deployment_id, "halted")
+            st.rerun()
+        if actions[3].button("🗑 Remove",
+                              key=f"lv_rm_{d.deployment_id}",
+                              use_container_width=True):
+            dep_mod.remove_deployment(account.login, d.deployment_id)
+            st.rerun()
+        if d.notes:
+            st.caption(d.notes)
+
+
+def _per_strategy_bar(rows: list[perf_query.StrategyPnL]) -> go.Figure:
+    if not rows:
+        return go.Figure().update_layout(height=240,
+                                            title="(no closed live trades yet)")
+    rows_sorted = sorted(rows, key=lambda r: r.total_pnl)
+    labels = [f"{r.strategy}<br>{r.ticker} {r.tf}" for r in rows_sorted]
+    values = [r.total_pnl for r in rows_sorted]
+    colors = ["#16a34a" if v >= 0 else "#dc2626" for v in values]
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker_color=colors,
+        text=[f"${v:+,.0f}" for v in values], textposition="outside",
+        hovertemplate="%{y}<br>P&L: $%{x:+,.2f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Live P&L by strategy",
+        height=max(220, 30 * len(rows_sorted) + 60),
+        margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        xaxis=dict(gridcolor="#1f2937", title="$ realized"),
+        yaxis=dict(gridcolor="#1f2937"),
+    )
+    return fig
+
+
+def _equity_chart(eq: pd.DataFrame, *, label: str,
+                    starting_balance: float) -> go.Figure:
+    if eq.empty:
+        return go.Figure().update_layout(height=240,
+                                            title="(no closed live trades)")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=eq["time_utc"], y=eq["equity"], mode="lines",
+        name="equity", line=dict(color="#16a34a", width=2),
+        fill="tozeroy", fillcolor="rgba(22,163,74,0.10)",
+    ))
+    fig.add_hline(y=starting_balance,
+                   line=dict(color="#6b7280", dash="dash"),
+                   annotation_text=f"start ${starting_balance:,.0f}",
+                   annotation_position="top right",
+                   annotation_font=dict(color="#6b7280", size=10))
+    fig.add_hline(y=starting_balance * 0.95,
+                   line=dict(color="#dc2626", dash="dot"),
+                   annotation_text="−5% FTMO daily",
+                   annotation_font=dict(color="#dc2626", size=10),
+                   annotation_position="bottom right")
+    fig.add_hline(y=starting_balance * 0.90,
+                   line=dict(color="#dc2626", dash="dot"),
+                   annotation_text="−10% FTMO total",
+                   annotation_font=dict(color="#dc2626", size=10),
+                   annotation_position="bottom right")
+    fig.update_layout(
+        title=f"Live equity — {label}",
+        height=320, margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(gridcolor="#1f2937", title="$ equity"),
+    )
+    return fig
+
+
+def _render_per_strategy_breakdown(account) -> None:
+    rows = perf_query.per_strategy_pnl(DB_PATH, mode=MODE)
+    st.plotly_chart(_per_strategy_bar(rows), use_container_width=True)
+    if rows:
+        df = pd.DataFrame([{
+            "Strategy": r.strategy,
+            "Ticker": r.ticker,
+            "TF": r.tf,
+            "Trades": r.n_trades,
+            "Win%": round(r.win_rate_pct, 1),
+            "Total P&L $": round(r.total_pnl, 2),
+            "Avg win $": round(r.avg_win, 2),
+            "Avg loss $": round(r.avg_loss, 2),
+            "Largest win $": round(r.largest_win, 2),
+            "Largest loss $": round(r.largest_loss, 2),
+            "Last trade UTC": r.last_trade_utc or "—",
+        } for r in rows])
+        st.dataframe(df, use_container_width=True,
+                       height=min(500, 38 * (len(df) + 1)))
+
+    st.markdown("### 📈  Strategy equity curve")
+    if not rows:
+        st.caption("(no closed live trades — nothing to chart yet)")
+        return
+    pick_options = ["ALL live combined"] + [f"{r.strategy} · {r.ticker} · {r.tf}"
+                                                for r in rows]
+    pick = st.selectbox("Pick a strategy to view its equity curve",
+                          pick_options, key="live_eq_pick")
+    starting = float(account.effective_baseline_equity)
+    if pick == "ALL live combined":
+        eq = perf_query.equity_curve(DB_PATH, mode=MODE,
+                                       starting_balance=starting)
+        label = "All live strategies combined"
+    else:
+        idx = pick_options.index(pick) - 1
+        r = rows[idx]
+        eq = perf_query.equity_curve(DB_PATH, mode=MODE,
+                                       strategy=r.strategy, ticker=r.ticker,
+                                       starting_balance=starting)
+        label = pick
+    st.plotly_chart(_equity_chart(eq, label=label,
+                                     starting_balance=starting),
+                     use_container_width=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Live", page_icon="🟢", layout="wide")
+    theme.inject_css()
+    st.title("🟢  Live Trading")
+    st.caption(
+        "Live deployments only. Pre-flight gates above must be GREEN. "
+        "Manage paper deployments on the **Paper** page (page 3).")
+
+    cfg = load_config()
+    try:
+        accounts = account_manager.list_accounts()
+        active = accounts[0] if accounts else None
+    except Exception:
+        active = None
+    if active is None:
+        st.warning("No MT5 account configured.")
+        return
+
+    # ---- 1. Pre-flight ----
+    all_green, checks = _render_preflight(cfg)
+    _render_preflight_strip(checks, all_green)
+
+    # ---- 2. Headline ----
+    summary = perf_query.overall_summary(DB_PATH, mode=MODE)
+    _render_headline(active, summary)
+
+    # ---- 3. Per-deployment LIVE cards ----
+    st.markdown("---")
+    try:
+        deployments = dep_mod.load_deployments(active.login)
+    except Exception:
+        deployments = []
+    live_deps = [d for d in deployments if d.status == "live"]
+    parity = ParityGate(DB_PATH)
+    # CRITICAL: parity is recorded under the BASE strategy name
+    # (e.g. 'ema_cross'), but deployments store the variant name
+    # (e.g. 'ema_cross_9_20'). We must resolve every variant to its
+    # base before asking the gate. Otherwise the Live page thinks every
+    # variant has no parity even after the user just ran it through
+    # Composer/Paper.
+    from dashboards.components.state import discover_strategies
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+    _strats_registry = discover_strategies()
+
+    def _base_for(variant: str) -> str:
+        return resolve_base_strategy(variant, _strats_registry) or variant
+
+    # Pre-compute parity status keyed by VARIANT (so the live card can
+    # do a direct lookup) but the gate is consulted via BASE.
+    parity_passed_by_variant: dict[str, bool] = {}
+    base_by_variant: dict[str, str] = {}
+    for d in deployments:
+        base = _base_for(d.strategy)
+        base_by_variant[d.strategy] = base
+        parity_passed_by_variant[d.strategy] = parity.is_recent(base)
+
+    # Variants that don't have a fresh parity (deduped, sorted)
+    needs_parity_variants = sorted({
+        v for v, ok in parity_passed_by_variant.items() if not ok
+    })
+    if needs_parity_variants:
+        with st.expander(
+            f"⚠ {len(needs_parity_variants)} strategy(s) need a "
+            f"replay-parity pass before going live",
+            expanded=False,
+        ):
+            st.markdown(
+                "These strategies do not have a recent (<24h) parity "
+                "pass on record. Click **Run parity now** to test "
+                "them inline — if divergence < $0.01 the pass records "
+                "automatically and live deployment unlocks.")
+            for variant in needs_parity_variants:
+                base = base_by_variant[variant]
+                # Find a deployment with this variant to get ticker/tf
+                dep_for_variant = next(
+                    (d for d in deployments if d.strategy == variant),
+                    None,
+                )
+                if dep_for_variant is None:
+                    continue
+                row = st.columns([2, 2, 2])
+                row[0].markdown(
+                    f"- `{variant}`  →  base `{base}`"
+                )
+                row[1].caption(
+                    f"on `{dep_for_variant.ticker}` `{dep_for_variant.tf}`"
+                )
+                if row[2].button(
+                    "🔬 Run parity now",
+                    key=f"_lv_run_parity_{variant}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    st.session_state["_lv_parity_target"] = {
+                        "variant": variant,
+                        "base": base,
+                        "ticker": dep_for_variant.ticker,
+                        "tf": dep_for_variant.tf,
+                        "long_only": dep_for_variant.long_only,
+                    }
+                    st.rerun()
+            st.caption(
+                "Or open **🟡 Paper page → Replay-parity** for the "
+                "full strategy picker."
+            )
+
+    # If a parity target is queued from one of the buttons above, run
+    # the dialog. The dialog handles the full PASS/FAIL flow.
+    target = st.session_state.get("_lv_parity_target")
+    if target is not None:
+        _render_live_parity_dialog(target)
+
+    if live_deps:
+        # Pull broker positions ONCE for all live cards (one bridge call,
+        # not one per row). Used by the holding-badge to show currently
+        # held positions inline.
+        from dashboards.components.holding_badge import (
+            find_position_for_deployment, summarize,
+        )
+        broker_positions = []
+        try:
+            from core.mt5_account import MT5AccountClient
+            broker_positions = MT5AccountClient().positions_get()
+        except Exception:
+            pass
+
+        # Header summary so the user knows holding/flat split
+        sm = summarize(live_deps, broker_positions)
+        st.markdown(
+            f"### 🟢  Currently live ({sm['n_running']})  ·  "
+            f"💼 {sm['n_holding']} holding  ·  "
+            f"⚪ {sm['n_flat']} flat"
+            + (f"  ·  ⛔ {sm['n_halted']} halted"
+               if sm['n_halted'] else "")
+        )
+        for d in live_deps:
+            pos = find_position_for_deployment(d, broker_positions)
+            _render_one_live_card(
+                active, d,
+                parity_passed=parity_passed_by_variant.get(d.strategy, False),
+                base_strategy_name=base_by_variant.get(d.strategy, d.strategy),
+                broker_position=pos,
+            )
+    else:
+        st.info(
+            "No deployments are currently LIVE. Promote a paper "
+            "deployment from the **Paper** page (page 3) — click "
+            "🚀 Promote → live on any 🟡 PAPER row.")
+
+    # ---- 4. Per-strategy live P&L ----
+    st.markdown("---")
+    st.markdown("## 📊  Per-strategy live P&L")
+    _render_per_strategy_breakdown(active)
+
+
+main()

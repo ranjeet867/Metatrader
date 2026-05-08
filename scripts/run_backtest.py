@@ -39,15 +39,23 @@ def main() -> int:
                     help="strategy name (auto-discovered from strategies/)")
     ap.add_argument("--params-json", default=None,
                     help="JSON dict of param overrides for the strategy (optional)")
-    ap.add_argument("--balance", type=float, default=91_400)
+    # All cost defaults come from core.cost_defaults — same constants
+    # the Backtest page + sweep + rebaseline use. Override here only
+    # for ad-hoc what-if runs; leave alone for catalog-consistent runs.
+    from core import cost_defaults as _cd
+    ap.add_argument("--balance", type=float,
+                    default=_cd.DEFAULT_STARTING_BALANCE_USD)
     ap.add_argument("--lots", type=float, default=0.1)
     ap.add_argument("--money-per-unit", type=float, default=1.0,
                     help="$ per 1.0 price unit per 1 lot (US100.cash default = $1)")
-    ap.add_argument("--commission-per-trade", type=float, default=0.0,
+    ap.add_argument("--commission-per-trade", type=float,
+                    default=_cd.DEFAULT_COMMISSION_USD,
                     help="$ deducted from realized_pnl per closed trade (round-trip)")
-    ap.add_argument("--slippage-atr-frac", type=float, default=0.0,
+    ap.add_argument("--slippage-atr-frac", type=float,
+                    default=_cd.DEFAULT_SLIPPAGE_ATR_FRAC,
                     help="per-fill slippage as fraction of ATR(14) at the fill bar")
-    ap.add_argument("--train-pct", type=float, default=0.6,
+    ap.add_argument("--train-pct", type=float,
+                    default=_cd.DEFAULT_TRAIN_PCT,
                     help="fraction of bars considered IN-SAMPLE for the train/test split")
     # ema_cross-specific shortcut flags (only used if --strategy ema_cross)
     ap.add_argument("--fast", type=int, default=9)
@@ -70,13 +78,31 @@ def main() -> int:
 
     # ---- Build the requested strategy ----
     if args.strategy == "ema_cross":
-        params = EmaCrossParams(
+        # Start from CLI args / defaults, then let --params-json override.
+        # Earlier this branch silently IGNORED --params-json — so any
+        # custom target_atr_mult passed via JSON would be replaced by
+        # the default 3.0, producing R:R 2.0 results when the user
+        # asked for R:R 2.7. Now JSON wins, matching the else branch.
+        kwargs = dict(
             fast_period=args.fast, slow_period=args.slow,
             atr_period=14,
             stop_atr_mult=args.stop_atr_mult,
             target_atr_mult=args.target_atr_mult,
             long_only=args.long_only,
         )
+        if args.params_json:
+            try:
+                overrides = json.loads(args.params_json)
+            except json.JSONDecodeError as e:
+                print(f"ERROR: --params-json is not valid JSON: {e}")
+                return 5
+            field_names = {f.name for f in dataclasses.fields(EmaCrossParams)}
+            bad = set(overrides) - field_names
+            if bad:
+                print(f"ERROR: unknown params for ema_cross: {bad}")
+                return 5
+            kwargs.update(overrides)
+        params = EmaCrossParams(**kwargs)
         strategy = EmaCross(params)
     else:
         strats = discover_strategies()
@@ -146,8 +172,11 @@ def main() -> int:
         print(f"  Return:           {ret_pct:+.2f}%")
 
     if result.n_trades > 0:
+        # Canonical convention — match summarize_trades + edge_catalog
+        # so CLI output, dashboard catalog, and Backtest page all
+        # agree on the same definition of win/loss/scratch.
         wins = [t for t in result.trades if t.realized_pnl > 0]
-        losses = [t for t in result.trades if t.realized_pnl <= 0]
+        losses = [t for t in result.trades if t.realized_pnl < 0]
         gross_wins = sum(t.realized_pnl for t in wins)
         gross_losses = -sum(t.realized_pnl for t in losses)
         win_rate = len(wins) / result.n_trades * 100
@@ -174,15 +203,24 @@ def main() -> int:
             print(f"    {m.label:<5s} n={m.n_trades:>4d}  PF={tr_pf:>5s}  "
                   f"avg_R={m.avg_R:>+6.3f}  win%={m.win_rate:>5.1f}  "
                   f"$={m.sum_pnl:>+10,.2f}")
-        # Sum invariant
+        # Sum invariant — partition splits MUST conserve total PnL.
+        # Tolerance scales with the magnitude of the sum so cumulative
+        # FP error on $100k+ runs doesn't false-alarm. 1e-9 × |total|
+        # is conservative; pure-FP error rarely exceeds 1e-12 × |total|.
         diff = train.sum_pnl + test.sum_pnl - result.sum_realized_pnl
-        if abs(diff) > 1e-6:
-            print(f"  ⛔ partition sum invariant broken: train+test - total = {diff}")
+        tol = max(1e-3, 1e-9 * abs(result.sum_realized_pnl))
+        if abs(diff) > tol:
+            print(f"  ⛔ partition sum invariant broken: "
+                  f"train+test - total = {diff} (tol ${tol:.6f})")
             return 4
 
     # ---- Persist to SQLite ----
     storage.init_schema(args.db)
-    run_id = "v2_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:6]
+    # 12 hex chars = 48 bits of entropy. Pre-fix used [:6] (24 bits) which
+    # could realistically collide under concurrent rebaseline runs (~16M
+    # variants per second). 48 bits gives ~2.8e14 — astronomical at our
+    # tx rate.
+    run_id = "v2_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:12]
     storage.save_run(
         args.db, run_id,
         started_at_utc=datetime.now(timezone.utc).isoformat(),

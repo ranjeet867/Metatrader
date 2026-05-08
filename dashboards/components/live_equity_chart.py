@@ -102,4 +102,4 @@ def render(*, daily_curve: pd.DataFrame, baseline_equity: float,
         font=dict(color="#cbd5e1"),
         bargap=0.4,
     )
-    target.plotly_chart(fig, use_container_width=True)
+    target.plotly_chart(fig, width="stretch")

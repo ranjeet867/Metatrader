@@ -1,0 +1,622 @@
+"""
+deployment_dialogs.py — st.dialog overlays for the Operations page.
+
+Replaces the silent-toast UX from before: every button on a deployment
+card now opens a modal with the relevant context — backtest results
+inline, pre-flight checks for Go Live, journal preview for Remove.
+
+Each function is decorated with @st.dialog and accepts a Deployment
+plus context. Streamlit only allows ONE active dialog at a time, so
+we use a session_state flag to choose which to open from the card
+click handlers.
+"""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from core import deployment as dep_mod
+from core.deployment import Deployment
+
+
+# Single key — only one dialog can be active at a time
+SS_DIALOG_KIND = "_ops_dialog_kind"          # "backtest" | "go_live" | "paper" | "remove"
+SS_DIALOG_DEP_ID = "_ops_dialog_dep_id"
+
+
+def open_dialog(kind: str, dep_id: str) -> None:
+    st.session_state[SS_DIALOG_KIND] = kind
+    st.session_state[SS_DIALOG_DEP_ID] = dep_id
+
+
+def clear_dialog() -> None:
+    st.session_state.pop(SS_DIALOG_KIND, None)
+    st.session_state.pop(SS_DIALOG_DEP_ID, None)
+
+
+def _money(v: float, sign: bool = False) -> str:
+    return ("${:+,.2f}" if sign else "${:,.2f}").format(v)
+
+
+def _resolve_base_strategy(variant_name: str, registered: dict) -> str | None:
+    """Thin shim around the shared resolver in strategy_resolver.py."""
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+    return resolve_base_strategy(variant_name, registered)
+
+
+def _run_parity_inline_for_dep(dep: Deployment, parity_gate) -> None:
+    """Run replay-parity for this deployment's strategy on its
+    ticker/tf. Records the pass to the parity gate. Shows a toast
+    + stores result in session for the dialog to display on rerun."""
+    import time
+    from core.config import load_config
+    from core.data import load_parquet
+    from core.parity_check import run_parity
+    from core.symbol_info_loader import try_load as try_load_symbol_info
+    from dashboards.components.state import (
+        DEFAULT_LOTS, DEFAULT_MONEY_PER_UNIT, discover_strategies,
+    )
+
+    REPO = Path(__file__).resolve().parents[2]
+    parquet = REPO / "data" / f"{dep.ticker}_{dep.tf}.parquet"
+    if not parquet.exists():
+        st.error(f"⛔ No parquet for `{dep.ticker}` `{dep.tf}` — "
+                  f"can't run parity. Use Data Manager to fetch.")
+        return
+
+    strategies = discover_strategies()
+    base = _resolve_base_strategy(dep.strategy, strategies)
+    if base is None:
+        st.error(f"⛔ Strategy `{dep.strategy}` not registered. "
+                  f"Registered: {sorted(strategies.keys())}")
+        return
+
+    StratCls, ParamsCls = strategies[base]
+    try:
+        strat = StratCls() if ParamsCls is None else StratCls(ParamsCls())
+    except Exception as e:
+        st.error(f"⛔ Could not instantiate strategy: {e}")
+        return
+
+    cfg = load_config()
+    df = load_parquet(parquet)
+    sym_info = try_load_symbol_info(dep.ticker)
+
+    t0 = time.time()
+    with st.spinner(f"Running parity for {base} × {dep.ticker} × {dep.tf}..."):
+        pr = run_parity(
+            df, strat, symbol=dep.ticker, tf=dep.tf,
+            starting_balance=100_000,
+            lots=DEFAULT_LOTS.get(dep.ticker, 0.1),
+            money_per_unit_price=resolve_money_per_unit(dep.ticker),
+            commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+            risk_cfg=cfg, symbol_info=sym_info,
+        )
+    elapsed = time.time() - t0
+    bt, rp, div = pr.bt, pr.rp, pr.divergence_dollars
+    if div < 0.01:
+        parity_gate.record_pass(base, divergence_dollars=div)
+        st.success(
+            f"✅ Parity PASSED in {elapsed:.2f}s — divergence ${div:.6f}. "
+            f"`{base}` is now cleared for live deployment for 24h."
+        )
+        st.toast(f"✅ {base} parity recorded")
+    else:
+        st.error(
+            f"⛔ Parity FAILED — divergence ${div:.4f} > $0.01 tolerance. "
+            f"BT: {bt.n_trades} trades / ${bt.sum_realized_pnl:+,.2f}, "
+            f"Replay: {rp.n_trades} trades / ${rp.sum_realized_pnl:+,.2f}. "
+            f"`{base}` BLOCKED from live until engine drift is fixed."
+        )
+        st.toast(f"⛔ {base} parity FAILED ${div:.2f} divergence", icon="⛔")
+
+
+# ---------------------------------------------------------------------------
+# Backtest dialog — runs the backtest inline and shows results
+# ---------------------------------------------------------------------------
+
+@st.dialog("Backtest", width="large")
+def backtest_dialog(*, dep: Deployment, login: int) -> None:
+    """Run the deployment's backtest right here and show the full picture
+    a quant trader actually wants: equity curve, drawdown curve, full
+    stats table including DD%, DD days, recovery days, max consecutive
+    losers, R:R, expectancy, CAGR. Default starting balance $100k so the
+    numbers read like an FTMO challenge would."""
+    import plotly.graph_objects as go
+
+    from core.backtest import partition_train_test, run_backtest
+    from core.backtest_stats import (
+        compute_full_stats,
+        rescale_to_starting_balance,
+    )
+    from core.data import load_parquet
+    from dashboards.components.state import discover_strategies
+
+    REPO = Path(__file__).resolve().parents[2]
+    parquet = REPO / "data" / f"{dep.ticker}_{dep.tf}.parquet"
+
+    st.markdown(
+        f"#### `{dep.strategy}` × `{dep.ticker}` × `{dep.tf}` "
+        + ("(long-only)" if dep.long_only else "(bidir)")
+    )
+    st.caption(f"Account #{login}  ·  risk **{dep.risk_pct:.2f}%**/trade  ·  "
+                f"daily cap **{dep.daily_cap_pct:.2f}%**")
+
+    if not parquet.exists():
+        st.error(f"No parquet at `{parquet.relative_to(REPO)}`. "
+                  "Use Data Manager to fetch it.")
+        if st.button("Close", key=f"bt_close_{dep.deployment_id}"):
+            clear_dialog()
+            st.rerun()
+        return
+
+    # User picks the simulated starting balance so the curve reads as
+    # 'what would $100k have looked like'. Real backtest still runs at
+    # 100k internally; we rescale only for display.
+    cols_input = st.columns([1, 1, 1])
+    start_bal = float(cols_input[0].number_input(
+        "Starting balance ($)", value=100_000.0, step=10_000.0,
+        min_value=1_000.0, max_value=10_000_000.0,
+        key=f"bt_startbal_{dep.deployment_id}",
+    ))
+    train_pct = float(cols_input[1].slider(
+        "Train split %", min_value=0.5, max_value=0.9, value=0.6, step=0.05,
+        key=f"bt_train_{dep.deployment_id}",
+    ))
+    commission = float(cols_input[2].number_input(
+        "Commission $/trade", value=3.0, step=0.5, min_value=0.0,
+        max_value=20.0, key=f"bt_comm_{dep.deployment_id}",
+    ))
+
+    strats = discover_strategies()
+    base = dep.strategy
+    for needle in ("_9_20", "_12_26", "_20_50", "_30_70",
+                    "_20_2", "_55", "_20", "_10"):
+        if base.endswith(needle):
+            base = base[: -len(needle)]
+            break
+    if base not in strats:
+        st.error(f"Strategy class `{base}` not in registry.")
+        if st.button("Close", key=f"bt_close2_{dep.deployment_id}"):
+            clear_dialog()
+            st.rerun()
+        return
+
+    StratCls, ParamsCls = strats[base]
+
+    with st.spinner("Loading parquet + running backtest…"):
+        df = load_parquet(parquet)
+        if ParamsCls is not None:
+            try:
+                strat = StratCls(ParamsCls(long_only=dep.long_only))
+            except TypeError:
+                strat = StratCls()
+        else:
+            strat = StratCls()
+        result = run_backtest(
+            df, strat.signals(df),
+            starting_balance=start_bal,
+            lots=1.0, money_per_unit_price=1.0,
+            commission_per_trade=commission,
+            slippage_per_fill_atr_frac=0.1,
+            symbol=dep.ticker,
+        )
+        stats = compute_full_stats(result, starting_balance=start_bal)
+
+    # Reconciliation
+    if result.reconciles:
+        st.success(
+            f"✅  Reconciliation green — divergence "
+            f"${abs(result.sum_realized_pnl - result.equity_curve_pnl):.4f}"
+        )
+    else:
+        st.error(
+            f"⛔  Reconciliation FAILED — divergence "
+            f"${abs(result.sum_realized_pnl - result.equity_curve_pnl):.2f}"
+        )
+
+    if result.n_trades == 0:
+        st.warning("Strategy generated zero trades on this parquet.")
+        if st.button("Close", key=f"bt_close_zero_{dep.deployment_id}"):
+            clear_dialog()
+            st.rerun()
+        return
+
+    # ─── Headline KPI strip ───────────────────────────────────────────
+    k1 = st.columns(5)
+    k1[0].metric("Trades", stats.n_trades)
+    k1[1].metric("Win rate", f"{stats.win_rate_pct:.1f}%",
+                    delta=f"{stats.n_wins}W / {stats.n_losses}L")
+    k1[2].metric("Profit factor",
+                    "inf" if stats.profit_factor == float("inf")
+                    else f"{stats.profit_factor:.2f}")
+    k1[3].metric("Avg R", f"{stats.avg_R:+.2f}")
+    k1[4].metric("Net P&L", _money(stats.sum_realized, sign=True))
+
+    k2 = st.columns(5)
+    k2[0].metric("Max DD",
+                    f"{stats.max_dd_pct:.1f}%",
+                    delta=f"-{_money(stats.max_dd_dollars)}",
+                    delta_color="inverse")
+    k2[1].metric("DD duration", f"{stats.max_dd_duration_days:.0f}d")
+    if stats.recovery_duration_days is None:
+        k2[2].metric("Recovery", "not yet",
+                       help="Equity hasn't reclaimed the previous peak.")
+    else:
+        k2[2].metric("Recovery", f"{stats.recovery_duration_days:.0f}d")
+    k2[3].metric("Max consec wins", stats.max_consec_wins)
+    k2[4].metric("Max consec losses", stats.max_consec_losses,
+                    delta_color="inverse")
+
+    k3 = st.columns(5)
+    k3[0].metric("Avg win", _money(stats.avg_win_dollars, sign=True))
+    k3[1].metric("Avg loss", _money(stats.avg_loss_dollars, sign=True),
+                    delta_color="inverse")
+    rr = stats.risk_reward_ratio
+    k3[2].metric("R:R ratio",
+                    "inf" if rr == float("inf") else f"{rr:.2f}",
+                    help="avg_win / |avg_loss|. >1 means wins outsize losses.")
+    k3[3].metric("Expectancy", _money(stats.expectancy_dollars, sign=True),
+                    help="Mean P&L per trade.")
+    if stats.cagr_pct is None:
+        k3[4].metric("CAGR",
+                       f"{(stats.sum_realized / start_bal * 100):.1f}%",
+                       help=f"Span {stats.span_days:.0f}d — too short to "
+                            "annualise; showing total return.")
+    else:
+        k3[4].metric("CAGR", f"{stats.cagr_pct:+.1f}%",
+                       help=f"Annualised over {stats.span_days:.0f} days.")
+
+    # ─── Equity curve + drawdown ──────────────────────────────────────
+    eq_rescaled = rescale_to_starting_balance(result, start_bal)
+    if eq_rescaled is not None and not eq_rescaled.empty:
+        eq = eq_rescaled.copy()
+        eq["time"] = pd.to_datetime(eq["time"], utc=True, errors="coerce")
+        eq = eq.dropna(subset=["time"]).sort_values("time")
+        eq["peak"] = eq["equity"].cummax()
+        eq["dd_dollars"] = eq["peak"] - eq["equity"]
+        eq["dd_pct"] = (eq["dd_dollars"] / eq["peak"] * 100.0).fillna(0.0)
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=eq["time"], y=eq["equity"], mode="lines",
+            name="equity", line=dict(color="#38bdf8", width=2),
+        ))
+        fig.add_trace(go.Scatter(
+            x=eq["time"], y=eq["peak"], mode="lines",
+            name="peak", line=dict(color="#9ca3af", width=1, dash="dot"),
+            hoverinfo="skip",
+        ))
+        fig.add_hline(y=start_bal,
+                       line=dict(color="#6b7280", width=1, dash="dash"),
+                       annotation_text=f"start ${start_bal:,.0f}",
+                       annotation_position="top right",
+                       annotation_font=dict(color="#6b7280", size=10))
+        # FTMO floors as visual references on a 100k scale
+        fig.add_hline(y=start_bal * 0.95,
+                       line=dict(color="#dc2626", width=1, dash="dash"),
+                       annotation_text="−5% (FTMO daily)",
+                       annotation_position="bottom right",
+                       annotation_font=dict(color="#dc2626", size=10))
+        fig.add_hline(y=start_bal * 0.90,
+                       line=dict(color="#dc2626", width=1, dash="dash"),
+                       annotation_text="−10% (FTMO total)",
+                       annotation_position="bottom right",
+                       annotation_font=dict(color="#dc2626", size=10))
+        fig.update_layout(
+            title=f"Equity from ${start_bal:,.0f} → ${eq['equity'].iloc[-1]:,.0f}",
+            height=320, margin=dict(l=10, r=10, t=40, b=10),
+            plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+            font=dict(color="#cbd5e1"),
+            xaxis=dict(gridcolor="#1f2937"),
+            yaxis=dict(gridcolor="#1f2937", title="$"),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Drawdown sub-chart
+        fig_dd = go.Figure()
+        fig_dd.add_trace(go.Scatter(
+            x=eq["time"], y=-eq["dd_pct"], mode="lines",
+            line=dict(color="#dc2626", width=1),
+            fill="tozeroy", fillcolor="rgba(220,38,38,0.25)",
+            name="drawdown %",
+        ))
+        fig_dd.update_layout(
+            title="Drawdown (%)",
+            height=180, margin=dict(l=10, r=10, t=30, b=10),
+            plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+            font=dict(color="#cbd5e1"),
+            xaxis=dict(gridcolor="#1f2937"),
+            yaxis=dict(gridcolor="#1f2937"),
+        )
+        st.plotly_chart(fig_dd, use_container_width=True)
+
+    # ─── Train/test split ──────────────────────────────────────────────
+    train, test = partition_train_test(result, train_pct, n_bars=len(df))
+    st.markdown(f"#### Train ({train_pct*100:.0f}%) / Test "
+                  f"({(1-train_pct)*100:.0f}%) split")
+    c2 = st.columns(2)
+    c2[0].markdown(
+        f"<div style='background:#0f1419;border:1px solid #1f2937;"
+        f"border-radius:8px;padding:10px;'>"
+        f"<b>Train</b> — n={train.n_trades} · "
+        f"PF {train.profit_factor:.2f} · "
+        f"R {train.avg_R:+.2f} · "
+        f"win {train.win_rate:.1f}% · "
+        f"$ {train.sum_pnl:+,.0f}</div>",
+        unsafe_allow_html=True)
+    c2[1].markdown(
+        f"<div style='background:#0f1419;border:1px solid #1f2937;"
+        f"border-radius:8px;padding:10px;'>"
+        f"<b>Test (OOS)</b> — n={test.n_trades} · "
+        f"PF {test.profit_factor:.2f} · "
+        f"R {test.avg_R:+.2f} · "
+        f"win {test.win_rate:.1f}% · "
+        f"$ {test.sum_pnl:+,.0f}</div>",
+        unsafe_allow_html=True)
+
+    st.caption(
+        f"Largest single win: {_money(stats.largest_win_dollars, sign=True)}  ·  "
+        f"largest single loss: {_money(stats.largest_loss_dollars, sign=True)}  ·  "
+        f"avg trade duration: {stats.avg_trade_bars:.1f} bars  ·  "
+        f"sharpe-on-R: {stats.sharpe_R:.2f}"
+    )
+
+    st.markdown("---")
+    if st.button("Close", use_container_width=True,
+                  key=f"bt_close3_{dep.deployment_id}"):
+        clear_dialog()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Paper-start dialog — confirms params, starts a paper run
+# ---------------------------------------------------------------------------
+
+@st.dialog("Start paper trading")
+def paper_dialog(*, dep: Deployment, login: int) -> None:
+    st.markdown(
+        f"#### `{dep.strategy}` × `{dep.ticker}` × `{dep.tf}` "
+        + ("(long-only)" if dep.long_only else "(bidir)")
+    )
+    st.markdown(
+        "Paper trading runs the same engine as live but emits **no orders**. "
+        "Trades are journalled to your account's database and show up on "
+        "the Performance page in `mode=paper`."
+    )
+    st.markdown(f"- Account: `{login}`")
+    st.markdown(f"- Risk per trade: `{dep.risk_pct:.2f}%`")
+    st.markdown(f"- Daily cap: `{dep.daily_cap_pct:.2f}%`")
+    st.markdown("- Time guards: weekend-flat + daily-close-flat")
+
+    if st.button("📡  Start paper run", type="primary",
+                  key=f"paper_start_{dep.deployment_id}"):
+        # Update status; the actual paper-loop wiring lives in Page 3
+        # so the user can monitor it there.
+        dep_mod.update_status(login, dep.deployment_id, "paper")
+        st.toast(f"📡 Paper started for {dep.deployment_id}")
+        clear_dialog()
+        st.rerun()
+    if st.button("Cancel", key=f"paper_cancel_{dep.deployment_id}"):
+        clear_dialog()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Go-Live dialog — pre-flight + DEPLOY-typed confirm
+# ---------------------------------------------------------------------------
+
+@st.dialog("Deploy live", width="large")
+def go_live_dialog(*, dep: Deployment, login: int, cfg, parity_gate,
+                    risk_tracker, time_guard_cfg, ftmo_clock,
+                    account_baseline: float) -> None:
+    from core import account_manager, market_clock
+    from core.time_guards import in_no_entry_window
+
+    st.markdown(
+        f"#### Deploy LIVE: `{dep.strategy}` × `{dep.ticker}` × `{dep.tf}`"
+    )
+    st.markdown(
+        f"Account `{login}`  ·  risk **{dep.risk_pct:.2f}%**/trade  ·  "
+        f"daily cap **{dep.daily_cap_pct:.2f}%**"
+    )
+
+    # Pre-flight checks
+    sentinel = Path(account_manager.EMERGENCY_STOP_FILE)
+    last_pass = parity_gate.last_pass_for(dep.strategy)
+    parity_ok = parity_gate.is_recent(dep.strategy, max_age_hours=24.0)
+    daily_loss = risk_tracker.account_daily_loss_pct()
+    in_win = in_no_entry_window(datetime.now(timezone.utc), time_guard_cfg)
+    market_status = market_clock.status_for(dep.ticker)
+
+    checks = [
+        ("EMERGENCY_STOP absent",
+         not sentinel.exists(),
+         "path: data/EMERGENCY_STOP"),
+        (f"Daily loss < {cfg.daily_loss_cap_pct}% cap",
+         daily_loss < cfg.daily_loss_cap_pct,
+         f"current: {daily_loss:.2f}%"),
+        (f"Replay-parity for `{dep.strategy}` < 24h",
+         parity_ok,
+         (f"last pass {last_pass[0].strftime('%Y-%m-%d %H:%M UTC')}, "
+          f"div=${last_pass[1]:.4f}" if last_pass
+          else "no parity pass on record")),
+        ("Outside no-entry window",
+         not in_win,
+         "currently in no-entry window" if in_win else "ok"),
+        (f"Market open ({dep.ticker})",
+         market_status.is_open,
+         (f"closes in {int(market_status.seconds_until_change/60)} min"
+          if market_status.is_open
+          else f"opens at {market_status.next_change_utc.strftime('%a %H:%M UTC')}")),
+        ("Account in allowlist",
+         (not cfg.live_safety_allowed_accounts
+          or login in cfg.live_safety_allowed_accounts),
+         f"allowlist: {list(cfg.live_safety_allowed_accounts) or '(open)'}"),
+    ]
+    n_ok = sum(1 for _, ok, _ in checks if ok)
+
+    st.markdown("##### Pre-flight checks")
+    for label, ok, detail in checks:
+        emoji = "✅" if ok else "⛔"
+        # Inline fix-buttons next to failing parity check
+        if not ok and "Replay-parity" in label:
+            row = st.columns([4, 1])
+            row[0].markdown(f"{emoji}  **{label}** — {detail}")
+            if row[1].button("🔬 Run now",
+                              key=f"gl_run_parity_{dep.deployment_id}",
+                              type="primary",
+                              use_container_width=True):
+                _run_parity_inline_for_dep(dep, parity_gate)
+                st.rerun()
+        else:
+            st.markdown(f"{emoji}  **{label}** — {detail}")
+
+    # Quick action buttons even when all checks pass — let user re-verify
+    # backtest / parity right from the dialog without leaving.
+    st.markdown("---")
+    st.markdown("##### Quick actions")
+    qa = st.columns(3)
+    if qa[0].button("📊 Run backtest",
+                      key=f"gl_act_bt_{dep.deployment_id}",
+                      use_container_width=True,
+                      help="Open the backtest dialog for this cell."):
+        st.session_state[SS_DIALOG_KIND] = "backtest"
+        st.rerun()
+    if qa[1].button("🔬 Run replay-parity",
+                      key=f"gl_act_parity_{dep.deployment_id}",
+                      use_container_width=True,
+                      help="Re-record parity for this strategy "
+                            "(recommended weekly)."):
+        _run_parity_inline_for_dep(dep, parity_gate)
+        st.rerun()
+    if qa[2].button("👁 Open Replay-Parity page",
+                      key=f"gl_act_parity_page_{dep.deployment_id}",
+                      use_container_width=True):
+        try:
+            st.switch_page("pages/B_🔬_Replay_Parity.py")
+        except Exception:
+            st.info("Use the sidebar → 🔬 Replay Parity page.")
+
+    # Risk math
+    st.markdown("##### Risk math")
+    risk_d = account_baseline * dep.risk_pct / 100.0
+    cap_d = account_baseline * dep.daily_cap_pct / 100.0
+    st.markdown(
+        f"- Risk per trade: `{dep.risk_pct:.2f}% = {_money(risk_d)}`\n"
+        f"- Daily cap: `{dep.daily_cap_pct:.2f}% = {_money(cap_d)}`\n"
+        f"- Max consecutive losses before cap hit: "
+        f"`{int(cap_d / max(1, risk_d))}`"
+    )
+
+    all_ok = all(ok for _, ok, _ in checks)
+    st.markdown("---")
+    if not all_ok:
+        st.error(
+            f"❌  {len(checks) - n_ok} pre-flight check(s) failed. "
+            "Fix the red items above before deploying.")
+        if st.button("Close", key=f"gl_close_fail_{dep.deployment_id}"):
+            clear_dialog()
+            st.rerun()
+        return
+
+    st.success(f"✅  All {n_ok} pre-flight checks green.")
+    st.markdown("Type **DEPLOY** exactly to confirm:")
+    confirm = st.text_input(
+        "confirm", value="", key=f"gl_confirm_{dep.deployment_id}",
+        label_visibility="collapsed",
+    )
+    cols = st.columns([1, 1])
+    if cols[0].button(
+        "🚀  Deploy live",
+        type="primary",
+        use_container_width=True,
+        disabled=(confirm != "DEPLOY"),
+        key=f"gl_deploy_{dep.deployment_id}",
+    ):
+        dep_mod.update_status(login, dep.deployment_id, "live")
+        # Audit
+        try:
+            from core.journal import JournalWriter
+            j = JournalWriter(account_manager.get_db_path(login))
+            j.record_bridge_event(
+                method="ui_go_live_confirmed", latency_ms=0, ok=True,
+                error=f"deployment={dep.deployment_id} risk_pct={dep.risk_pct}",
+            )
+        except Exception:
+            pass
+        st.toast(f"🚀 LIVE: {dep.deployment_id}")
+        clear_dialog()
+        st.rerun()
+    if cols[1].button("Cancel", use_container_width=True,
+                       key=f"gl_cancel_{dep.deployment_id}"):
+        clear_dialog()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Remove dialog — confirm + show what will be lost
+# ---------------------------------------------------------------------------
+
+@st.dialog("Remove deployment")
+def remove_dialog(*, dep: Deployment, login: int) -> None:
+    st.markdown(
+        f"Remove **`{dep.deployment_id}`** from account #{login}?"
+    )
+    st.markdown(f"- Strategy: `{dep.strategy}`")
+    st.markdown(f"- Ticker × TF: `{dep.ticker}` × `{dep.tf}`")
+    st.markdown(f"- Status: `{dep.status}`")
+    if dep.last_started_at_utc:
+        st.markdown(f"- Last started: `{dep.last_started_at_utc[:19]}`")
+    st.warning(
+        "Removing a deployment **does not** close any open positions. "
+        "Use the Position Manager tab for that. The deployment is just "
+        "removed from this account's portfolio list.")
+    cols = st.columns([1, 1])
+    if cols[0].button("🗑  Remove", type="primary",
+                       use_container_width=True,
+                       key=f"rm_yes_{dep.deployment_id}"):
+        dep_mod.remove_deployment(login, dep.deployment_id)
+        st.toast(f"Removed {dep.deployment_id}")
+        clear_dialog()
+        st.rerun()
+    if cols[1].button("Cancel", use_container_width=True,
+                       key=f"rm_no_{dep.deployment_id}"):
+        clear_dialog()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Dispatch — call from the Operations page after card render
+# ---------------------------------------------------------------------------
+
+def render_active_dialog(*, deployments, login, cfg=None, parity_gate=None,
+                          risk_tracker=None, time_guard_cfg=None,
+                          ftmo_clock=None, account_baseline: float = 100_000.0
+                          ) -> None:
+    """Render whichever dialog is active in session_state. Call this once,
+    after the deployment cards are rendered."""
+    kind = st.session_state.get(SS_DIALOG_KIND)
+    dep_id = st.session_state.get(SS_DIALOG_DEP_ID)
+    if not kind or not dep_id:
+        return
+    dep = next((d for d in deployments if d.deployment_id == dep_id), None)
+    if dep is None:
+        clear_dialog()
+        return
+    if kind == "backtest":
+        backtest_dialog(dep=dep, login=login)
+    elif kind == "paper":
+        paper_dialog(dep=dep, login=login)
+    elif kind == "go_live":
+        go_live_dialog(
+            dep=dep, login=login, cfg=cfg, parity_gate=parity_gate,
+            risk_tracker=risk_tracker, time_guard_cfg=time_guard_cfg,
+            ftmo_clock=ftmo_clock, account_baseline=account_baseline,
+        )
+    elif kind == "remove":
+        remove_dialog(dep=dep, login=login)

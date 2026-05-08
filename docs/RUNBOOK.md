@@ -210,3 +210,82 @@ WHERE method LIKE 'preflight_deny:%' ORDER BY ROWID DESC;
 - Emergency stop must work even when the dashboard is broken.
 
 If any of these break, halt the system and root-cause before resuming.
+
+## 14. Upgrading the MT5 bridge for Phase 2.5 position management
+
+**Symptom:** the dashboard's Position Manager panel shows:
+
+> ℹ Your MT5 bridge EA doesn't yet implement the position methods
+> (`positions_get`, `position_close`, `history_deals_get`).
+
+**Cause:** your MT5 file-bridge EA is still the Phase-1 version that only
+implements `account_info / symbol_info / copy_rates`. The Phase-2.5
+version adds the live-position methods.
+
+**Fix:** install the bundled `V2Bridge.mq5` EA. **Approx 5 minutes.**
+
+### Step-by-step
+
+1. **Open MetaEditor** in MT5 (press `F4` from the terminal, or
+   *Tools → MetaQuotes Language Editor*).
+2. **Copy the EA into your MQL5 folder:**
+   - In MetaEditor: *File → Open → navigate to* `<repo>/mql5/V2Bridge.mq5`
+   - Or copy the file to `MQL5/Experts/V2Bridge.mq5` inside your MT5
+     data directory (in MT5: *File → Open Data Folder → MQL5/Experts/*).
+3. **Compile.** Press `F7`. Should report `0 errors, 0 warnings`.
+4. **Drag the EA onto any chart** in the MT5 terminal:
+   - Navigator → Expert Advisors → V2Bridge → drag onto a chart
+   - It doesn't matter which chart — the EA polls files, not chart data.
+5. **In the dialog box that appears:**
+   - **Common** tab → tick **Allow algorithmic trading**
+   - **Inputs** tab → leave all defaults (RequestFile, ResponseFile,
+     PollMs, MaxBars, MagicNumber)
+   - Click **OK**
+6. **Verify** in the *Experts* log tab — you should see:
+
+   ```
+   V2Bridge EA started. Polling v2_bridge_request.json every 100 ms
+   ```
+
+7. **Smoke-test from the dashboard:**
+   - Refresh `localhost:8502/Operations`
+   - The Position Manager panel should switch from "read-only" warning to
+     a live position table (empty if no open positions).
+   - Open a small position manually in MT5 → it appears in the table
+     within ~5 seconds.
+   - Use the per-row **Close** button to close it from the dashboard.
+
+### What V2Bridge.mq5 provides
+
+| RPC method | Used by dashboard component |
+|---|---|
+| `account_info` | KPI strip, FTMO progress, Auto-detect |
+| `symbol_info` | Position sizer (tick_value, volume_step) |
+| `copy_rates` | Data Manager refresh |
+| `positions_get` | Position Manager table |
+| `position_close` | Per-position Close + Close ALL |
+| `history_deals_get` | Account statement realized PnL |
+
+There is **no** order-placement RPC by design — order placement is
+handled separately by `core/live_executor.py`, so a buggy Python script
+can never trick the bridge into opening a position.
+
+### Common gotchas
+
+- **"unknown method" persists after install** — make sure you actually
+  attached the new EA. The old EA on a chart still polls the same file.
+  Remove the old EA via *Expert tab → right-click → Remove*, then drag
+  the new one on.
+- **Auto-trading button is red in MT5 toolbar** — global auto-trading
+  is disabled. Click the smiley to make it green, or the EA's
+  PositionClose calls will all fail with `retcode=10011`.
+- **File path mismatch** — if you changed the `RequestFile` /
+  `ResponseFile` inputs on the EA, you also have to edit `core/data.py`
+  on the Python side. Default names match out of the box.
+
+### Going to live order placement
+
+V2Bridge intentionally only closes existing positions. Opening positions
+in live mode requires the Phase-3 EA (`scripts/strategy_to_mql5.py`
+template) plus the 8 pre-flight gates in `core/live_executor.py`. See
+section 4 of this runbook.

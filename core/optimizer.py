@@ -47,6 +47,15 @@ class CellScore:
     p_pass_30d: float | None    # FTMO simulation
     score: float                # Composite score (higher = better)
     sustained: bool             # Stayed above FTMO -10% floor on every bar
+    # Phase 2: absolute-dollar fields for AlgoTest-style depth.
+    # Computed on $100k baseline so they're directly comparable across
+    # tickers and strategies.
+    net_pnl_dollars: float = 0.0       # sum of OOS realized P&L
+    max_dd_dollars: float = 0.0        # biggest peak-to-trough $ on $100k
+    max_dd_days: float = 0.0           # peak → trough span (days)
+    avg_win_dollars: float = 0.0       # mean realized P&L of winners
+    avg_loss_dollars: float = 0.0      # mean realized P&L of losers (negative)
+    side: str = "long"                 # 'long' | 'short' | 'bidir'
     notes: str = ""
 
 
@@ -136,7 +145,11 @@ RR_VARIANTS: list[RRConfig] = [
 # ---------------------------------------------------------------------------
 
 def render_markdown(cells: list[CellScore], *, run_meta: str = "") -> str:
-    """Pretty markdown table for `docs/optimization_<date>.md`."""
+    """Pretty markdown table for `docs/optimization_<date>.md`.
+
+    Emits the wide ($-aware) format: 23 columns including absolute-dollar
+    drawdown, avg win/loss, and net P&L on a $100k baseline. AlgoTest-style.
+    """
     lines = [
         "# Portfolio optimization — autonomous run",
         "",
@@ -145,11 +158,14 @@ def render_markdown(cells: list[CellScore], *, run_meta: str = "") -> str:
         "Score = profit_factor + R + R:R + sample-size + FTMO_pass_bonus",
         "       − drawdown_penalty − consec-loss_penalty",
         "",
-        "Higher is better. `sustained` = equity never breached FTMO −10% floor.",
+        "All `$` values are out-of-sample, scaled to a **$100k starting "
+        "balance** so they're directly comparable. `sustained` = equity "
+        "never breached FTMO −10% floor.",
         "",
-        "| rank | strategy | ticker | tf | R:R | n | PF | R | win% | maxDD% "
-        "| recov_d | streak | rr | CAGR | P(pass) | sus | score |",
-        "|---:|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| rank | strategy | ticker | tf | side | R:R | n | PF | R | win% "
+        "| netPnL$ | maxDD% | maxDD$ | DDdays | recovD | streak | rr "
+        "| avgWin$ | avgLoss$ | CAGR | P(pass) | sus | score |",
+        "|---:|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for i, r in enumerate(cells, start=1):
         cagr = (f"{r.cagr_pct:+.1f}%" if r.cagr_pct is not None
@@ -163,10 +179,13 @@ def render_markdown(cells: list[CellScore], *, run_meta: str = "") -> str:
         pf_disp = ("inf" if r.test_pf == float("inf")
                     else f"{r.test_pf:.2f}")
         lines.append(
-            f"| {i} | `{r.strategy}` | `{r.ticker}` | `{r.tf}` | {r.rr_label} "
-            f"| {r.n_test} | {pf_disp} | {r.test_r:+.2f} | {r.win_rate:.0f} "
-            f"| {r.max_dd_pct:.1f} | {recov} | {r.max_consec_losses} "
-            f"| {rr_disp} | {cagr} | {ppass} "
+            f"| {i} | `{r.strategy}` | `{r.ticker}` | `{r.tf}` | {r.side} "
+            f"| {r.rr_label} | {r.n_test} | {pf_disp} | {r.test_r:+.2f} "
+            f"| {r.win_rate:.0f} | {r.net_pnl_dollars:+,.0f} "
+            f"| {r.max_dd_pct:.1f} | {r.max_dd_dollars:,.0f} "
+            f"| {r.max_dd_days:.0f} | {recov} | {r.max_consec_losses} "
+            f"| {rr_disp} | {r.avg_win_dollars:+,.0f} "
+            f"| {r.avg_loss_dollars:+,.0f} | {cagr} | {ppass} "
             f"| {'✅' if r.sustained else '⛔'} | {r.score:.1f} |"
         )
     return "\n".join(lines) + "\n"

@@ -290,6 +290,195 @@ def test_close_does_not_check_no_entry_window(executor, tmp_path):
     assert res.ticket == 42
 
 
+def test_close_uses_position_close_method_name(executor, tmp_path):
+    """REGRESSION: live_executor previously called the bridge with method
+    name 'order_close' but the MT5 EA registers 'position_close'. Every
+    HALT / Demote / forced-flat silently failed at the bridge.
+    """
+    res = executor.close_position(ticket=42, comment="manual",
+                                    now_utc=SAFE_NOW)
+    assert res.ticket == 42
+    # The mock bridge appends every call to _bridge_calls — the most
+    # recent must be position_close, not order_close.
+    last_call_method, last_call_params = executor._bridge_calls[-1]
+    assert last_call_method == "position_close", (
+        f"expected method 'position_close' but live_executor called "
+        f"'{last_call_method}' — the EA does not register that name"
+    )
+    assert last_call_params["ticket"] == 42
+    assert last_call_params["comment"] == "manual"
+
+
+def test_close_retries_on_transient_failure(tmp_path):
+    """If the bridge returns {ok: False, error: ...} on the first
+    attempt, the executor retries. After all retries exhausted it
+    raises BridgeCloseFailed so the caller can mark the deployment
+    halted and surface the error in the UI."""
+    from core.live_executor import BridgeCloseFailed, LiveExecutor
+
+    db = tmp_path / "v2.db"
+    cfg = _build_cfg()
+    tg = _build_tg_cfg()
+    attempts = []
+
+    def flaky_bridge(method, params):
+        attempts.append((method, params))
+        # Fail twice, then succeed
+        if len(attempts) < 3:
+            return {"ok": False, "error": "TRADE_RETCODE_REQUOTE"}
+        return {"ok": True, "ticket": 42}
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=cfg, time_guard_cfg=tg,
+        account_login=12345, bridge_call=flaky_bridge,
+        emergency_stop_dir=tmp_path,
+    )
+    res = ex.close_position(ticket=42, comment="t", retries=3,
+                              now_utc=SAFE_NOW)
+    assert res.ticket == 42
+    assert len(attempts) == 3      # 2 failures + 1 success
+    assert all(a[0] == "position_close" for a in attempts)
+
+
+def test_close_raises_bridge_close_failed_after_retries(tmp_path):
+    from core.live_executor import BridgeCloseFailed, LiveExecutor
+
+    db = tmp_path / "v2.db"
+    cfg = _build_cfg()
+    tg = _build_tg_cfg()
+
+    def always_fail(method, params):
+        return {"ok": False, "error": "MARKET_CLOSED"}
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=cfg, time_guard_cfg=tg,
+        account_login=12345, bridge_call=always_fail,
+        emergency_stop_dir=tmp_path,
+    )
+    with pytest.raises(BridgeCloseFailed) as exc:
+        ex.close_position(ticket=99, comment="halt", retries=2,
+                            now_utc=SAFE_NOW)
+    assert "MARKET_CLOSED" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: order_send silent-failure bug (Phase 30)
+# ---------------------------------------------------------------------------
+
+def test_order_send_raises_on_broker_rejection(tmp_path):
+    """Bridge returns ok=False, retcode=10018 (market closed). Previously
+    this silently returned a LiveOrder with ticket=0 and the runner
+    thought the order succeeded. Now it must raise BridgeOrderRejected
+    with the retcode + error preserved."""
+    from core.live_executor import BridgeOrderRejected, LiveExecutor
+
+    db = tmp_path / "v2.db"
+
+    def rejecting_bridge(method, params):
+        return {
+            "ok": False,
+            "retcode": 10018,
+            "error": "MARKET_CLOSED",
+            "comment": "Market is closed",
+        }
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=_build_cfg(),
+        time_guard_cfg=_build_tg_cfg(),
+        account_login=12345, bridge_call=rejecting_bridge,
+        emergency_stop_dir=tmp_path,
+    )
+    ex.parity_gate.record_pass("vol_breakout", 0.0,
+                                  at_utc=SAFE_NOW - timedelta(hours=1))
+    with pytest.raises(BridgeOrderRejected) as exc:
+        ex.send_order(symbol="US100.cash", direction="LONG",
+                        lots=0.1, sl=99.0, tp=110.0,
+                        strategy="vol_breakout", idempotency_key="K1",
+                        now_utc=SAFE_NOW)
+    assert exc.value.retcode == 10018
+    assert "MARKET_CLOSED" in str(exc.value)
+
+
+def test_order_send_raises_on_missing_ok_key(tmp_path):
+    """Malformed bridge response (no 'ok' key). Previously defaulted to
+    optimistic ok=True. Now treated as failure."""
+    from core.live_executor import BridgeOrderRejected, LiveExecutor
+
+    db = tmp_path / "v2.db"
+
+    def malformed_bridge(method, params):
+        # Note: NO 'ok' key
+        return {"retcode": 10004, "ticket": 12345}
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=_build_cfg(),
+        time_guard_cfg=_build_tg_cfg(),
+        account_login=12345, bridge_call=malformed_bridge,
+        emergency_stop_dir=tmp_path,
+    )
+    ex.parity_gate.record_pass("vol_breakout", 0.0,
+                                  at_utc=SAFE_NOW - timedelta(hours=1))
+    with pytest.raises(BridgeOrderRejected):
+        ex.send_order(symbol="US100.cash", direction="LONG",
+                        lots=0.1, sl=99.0, tp=110.0,
+                        strategy="vol_breakout", idempotency_key="K2",
+                        now_utc=SAFE_NOW)
+
+
+def test_order_send_raises_when_ok_true_but_ticket_zero(tmp_path):
+    """If the bridge says ok=True but ticket=0, that's a contract
+    violation — refuse and raise so the runner doesn't think a phantom
+    order succeeded."""
+    from core.live_executor import BridgeOrderRejected, LiveExecutor
+
+    db = tmp_path / "v2.db"
+
+    def liar_bridge(method, params):
+        return {"ok": True, "ticket": 0}
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=_build_cfg(),
+        time_guard_cfg=_build_tg_cfg(),
+        account_login=12345, bridge_call=liar_bridge,
+        emergency_stop_dir=tmp_path,
+    )
+    ex.parity_gate.record_pass("vol_breakout", 0.0,
+                                  at_utc=SAFE_NOW - timedelta(hours=1))
+    with pytest.raises(BridgeOrderRejected) as exc:
+        ex.send_order(symbol="US100.cash", direction="LONG",
+                        lots=0.1, sl=99.0, tp=110.0,
+                        strategy="vol_breakout", idempotency_key="K3",
+                        now_utc=SAFE_NOW)
+    assert "ticket=0" in str(exc.value)
+
+
+def test_order_send_succeeds_when_ok_true_with_valid_ticket(tmp_path):
+    """Happy path: the existing test fixture covers this, but pin it
+    here too so we know our stricter checks didn't break the success
+    path."""
+    from core.live_executor import LiveExecutor
+
+    db = tmp_path / "v2.db"
+
+    def good_bridge(method, params):
+        return {"ok": True, "ticket": 42, "retcode": 10009,
+                "fill_price": 25234.7}
+
+    ex = LiveExecutor(
+        db_path=db, risk_config=_build_cfg(),
+        time_guard_cfg=_build_tg_cfg(),
+        account_login=12345, bridge_call=good_bridge,
+        emergency_stop_dir=tmp_path,
+    )
+    ex.parity_gate.record_pass("vol_breakout", 0.0,
+                                  at_utc=SAFE_NOW - timedelta(hours=1))
+    order = ex.send_order(symbol="US100.cash", direction="LONG",
+                            lots=0.1, sl=99.0, tp=110.0,
+                            strategy="vol_breakout", idempotency_key="K4",
+                            now_utc=SAFE_NOW)
+    assert order.ticket == 42
+
+
 # ---------------------------------------------------------------------------
 # Audit trail — refusals are logged
 # ---------------------------------------------------------------------------

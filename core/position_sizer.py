@@ -87,23 +87,39 @@ def calc_lots(
     entry_price: float,
     stop_price: float,
     sym: SymbolInfo,
+    *,
+    max_lots: float | None = None,
+    max_money_risk_usd: float | None = None,
 ) -> SizingResult:
     """Compute exact lots from a risk-percent target.
 
     Steps:
       1. risk_amount  = equity * risk_pct / 100
+         If `max_money_risk_usd` is set, risk_amount is HARD-CAPPED to that
+         value. This is the safety net against tight-stop blow-ups: even
+         if risk_pct × equity says you can lose $400, max_money_risk_usd
+         of $300 forces lots small enough to risk only $300. Crucial for
+         instruments like XAUUSD where 1 wrong lot = 5% account in a few
+         ticks.
       2. money_per_lot_at_sl = (|entry-stop| / tick_size) * tick_value
       3. raw_lots     = risk_amount / money_per_lot_at_sl
       4. floored      = floor_to_step(raw_lots, volume_step)
       5. If floored < volume_min: bump to volume_min UNLESS that would
          exceed risk_amount * 1.10 → reject.
       6. If floored > volume_max: clamp DOWN to volume_max (rounded to step).
-      7. If actual_money_risk > risk_amount * 1.10 → reject (rounding_overshoot).
+      7. If `max_lots` is provided AND floored > max_lots: clamp DOWN to
+         max_lots (rounded to step). This is the user-side risk cap — your
+         FTMO challenge may permit fewer lots than the symbol's volume_max.
+      8. If actual_money_risk > risk_amount * 1.10 → reject (rounding_overshoot).
     """
     if equity <= 0 or risk_pct <= 0:
         return SizingResult(False, 0.0, 0.0, 0.0, "invalid_inputs")
 
     risk_amount = equity * risk_pct / 100.0
+    # Hard $-ceiling: never let one trade risk more than this absolute amount.
+    # This is the safety against tight-stop blow-ups on volatile instruments.
+    if max_money_risk_usd is not None and max_money_risk_usd > 0:
+        risk_amount = min(risk_amount, float(max_money_risk_usd))
     stop_distance = abs(entry_price - stop_price)
 
     if stop_distance <= 0:
@@ -128,6 +144,15 @@ def calc_lots(
 
     if floored > sym.volume_max:
         floored = floor_to_step(sym.volume_max, sym.volume_step)
+
+    # User-side max-lots cap (FTMO challenges typically allow far fewer
+    # lots than the broker's symbol volume_max).
+    if max_lots is not None and max_lots > 0 and floored > max_lots:
+        floored = floor_to_step(max_lots, sym.volume_step)
+        # If the cap drops below volume_min, surface a clear rejection.
+        if floored < sym.volume_min:
+            return SizingResult(False, 0.0, 0.0, risk_amount,
+                                  "max_lots_below_volume_min")
 
     floored = _round_to_step_precision(floored, sym.volume_step)
     actual_money_risk = floored * money_per_lot_at_sl

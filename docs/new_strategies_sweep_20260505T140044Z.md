@@ -1,0 +1,66 @@
+# New strategies sweep — 2026-05-05T14:00:44.674220Z
+
+Cost: $4.0/trade + 0.05×ATR slip · split 60%/40%
+
+| Strategy | Ticker | TF | n_test | PF_train | PF_test | R_test | WR% | R:R | recD | DD% | safe | Score | note |
+|----------|--------|----|-------:|---------:|--------:|-------:|----:|----:|-----:|----:|:---:|------:|------|
+| vol_break_20 | JP225.cash | H1 | 17 | 0.97 | 1.51 | +0.50 | 53% | 1.80 | never | 3.8% | ✗ | 27.8 | ok |
+| vol_break_20 | EURUSD | M15 | 32 | 0.53 | 1.31 | +0.29 | 47% | 1.72 | 7d | 1.1% | ✗ | 26.5 | ok |
+| trend_pullback_regime | US30.cash | M15 | 56 | 0.70 | 1.81 | +0.03 | 46% | 1.21 | 1d | 2.6% | ✗ | 26.0 | ok |
+| orb_vol_filtered | US30.cash | M15 | 26 | 0.72 | 1.31 | +0.25 | 46% | 1.68 | 12d | 1.8% | ✗ | 23.4 | ok |
+| orb_vol_filtered | US100.cash | H1 | 62 | 0.85 | 1.20 | +0.10 | 40% | 1.71 | 39d | 4.6% | ✗ | 20.4 | ok |
+| orb_vol_filtered | FRA40.cash | H1 | 35 | 0.44 | 1.16 | +0.07 | 40% | 1.65 | 20d | 0.9% | ✗ | 19.0 | ok |
+| orb_vol_filtered | US100.cash | M15 | 23 | 0.78 | 1.11 | +0.06 | 39% | 1.70 | 17d | 2.7% | ✗ | 18.1 | ok |
+| vol_break_20 | UK100.cash | H1 | 20 | 0.68 | 1.02 | +0.10 | 40% | 1.75 | never | 0.8% | ✗ | 17.7 | ok |
+| trend_pullback_regime | US500.cash | M15 | 78 | 0.46 | 1.68 | -0.06 | 45% | 1.11 | 7d | 1.0% | ✗ | 17.3 | ok |
+| trend_pullback_regime | US100.cash | M15 | 113 | 0.77 | 1.36 | -0.05 | 42% | 1.28 | 12d | 7.1% | ✗ | 16.7 | ok |
+| orb_vol_filtered | GER40.cash | H1 | 52 | 0.76 | 1.15 | +0.03 | 38% | 1.68 | never | 3.4% | ✗ | 16.3 | ok |
+| vol_break_20 | US500.cash | M15 | 44 | 0.74 | 0.87 | +0.03 | 39% | 1.65 | never | 0.8% | ✗ | 16.0 | ok |
+| vol_break_20 | US100.cash | M15 | 52 | 0.81 | 0.88 | +0.02 | 37% | 1.78 | never | 5.6% | ✗ | 15.7 | ok |
+| orb_vol_filtered | JP225.cash | M15 | 30 | 0.52 | 0.92 | -0.01 | 37% | 1.69 | 8d | 2.4% | ✗ | 13.4 | ok |
+| trend_pullback_regime | US30.cash | H1 | 97 | 0.96 | 0.97 | -0.18 | 37% | 1.24 | 46d | 11.2% | ✗ | 12.2 | ok |
+| orb_vol_filtered | US500.cash | M15 | 20 | 0.97 | 0.83 | -0.26 | 30% | 1.56 | 17d | 0.5% | ✗ | 11.3 | ok |
+| vwap_fade | US30.cash | H1 | 664 | 0.40 | 0.42 | -0.76 | 16% | 1.72 | never | 34.5% | ✗ | 10.8 | ok |
+| vwap_fade | EURUSD | H1 | 662 | 0.56 | 0.50 | -0.64 | 18% | 1.96 | never | 14.4% | ✗ | 10.8 | ok |
+| vwap_fade | UK100.cash | H1 | 649 | 0.54 | 0.51 | -0.73 | 18% | 1.93 | never | 10.2% | ✗ | 10.7 | ok |
+| vwap_fade | US100.cash | H1 | 633 | 0.54 | 0.47 | -0.73 | 14% | 2.15 | never | 50.7% | ✗ | 10.7 | ok |
+| vwap_fade | GER40.cash | H1 | 631 | 0.53 | 0.61 | -0.66 | 20% | 1.63 | never | 17.6% | ✗ | 10.7 | ok |
+| vwap_fade | EURUSD | M15 | 578 | 0.52 | 0.52 | -0.77 | 15% | 2.25 | never | 8.5% | ✗ | 10.7 | ok |
+| vwap_fade | XAUUSD | H1 | 553 | 0.64 | 0.61 | -0.52 | 20% | 1.96 | never | 50.7% | ✗ | 10.6 | ok |
+| vwap_fade | US500.cash | M15 | 551 | 0.46 | 0.44 | -0.79 | 16% | 2.40 | never | 6.7% | ✗ | 10.6 | ok |
+| vwap_fade | US30.cash | M15 | 541 | 0.60 | 0.69 | -0.49 | 18% | 2.46 | never | 12.6% | ✗ | 10.6 | ok |
+| vwap_fade | JP225.cash | H1 | 530 | 0.65 | 0.56 | -0.51 | 19% | 2.07 | never | 38.9% | ✗ | 10.6 | ok |
+| vwap_fade | US100.cash | M15 | 493 | 0.59 | 0.65 | -0.58 | 17% | 2.32 | never | 19.5% | ✗ | 10.6 | ok |
+| vwap_fade | HK50.cash | M15 | 464 | 0.69 | 0.61 | -0.58 | 17% | 2.28 | never | 14.8% | ✗ | 10.5 | ok |
+| vwap_fade | JP225.cash | M15 | 458 | 0.74 | 0.82 | -0.31 | 17% | 3.35 | never | 12.1% | ✗ | 10.5 | ok |
+| vwap_fade | XAUUSD | M15 | 443 | 0.59 | 0.82 | -0.26 | 16% | 3.80 | never | 18.5% | ✗ | 10.5 | ok |
+| trend_pullback_regime | EURUSD | H1 | 145 | 0.81 | 0.72 | -0.23 | 36% | 1.21 | never | 7.2% | ✗ | 10.2 | ok |
+| trend_pullback_regime | US100.cash | H1 | 133 | 0.95 | 0.58 | -0.34 | 29% | 1.31 | never | 55.5% | ✗ | 10.2 | ok |
+| trend_pullback_regime | JP225.cash | M15 | 132 | 0.74 | 0.70 | -0.19 | 36% | 1.25 | never | 16.5% | ✗ | 10.2 | ok |
+| trend_pullback_regime | HK50.cash | M15 | 129 | 0.89 | 0.65 | -0.23 | 35% | 1.25 | never | 10.5% | ✗ | 10.2 | ok |
+| trend_pullback_regime | JP225.cash | H1 | 128 | 0.91 | 0.97 | -0.18 | 37% | 1.27 | never | 10.1% | ✗ | 10.2 | ok |
+| trend_pullback_regime | GER40.cash | H1 | 120 | 1.06 | 0.77 | -0.22 | 35% | 1.26 | never | 7.2% | ✗ | 10.1 | ok |
+| trend_pullback_regime | FRA40.cash | H1 | 118 | 0.54 | 0.94 | -0.13 | 41% | 1.18 | never | 2.7% | ✗ | 10.1 | ok |
+| trend_pullback_regime | XAUUSD | M15 | 114 | 0.83 | 0.92 | -0.20 | 36% | 1.26 | never | 10.5% | ✗ | 10.1 | ok |
+| trend_pullback_regime | EURUSD | M15 | 109 | 0.78 | 0.80 | -0.23 | 37% | 1.16 | never | 2.5% | ✗ | 10.1 | ok |
+| trend_pullback_regime | UK100.cash | H1 | 106 | 0.94 | 1.08 | -0.08 | 42% | 1.19 | never | 2.1% | ✗ | 10.1 | ok |
+| trend_pullback_regime | XAUUSD | H1 | 102 | 1.00 | 0.65 | -0.22 | 34% | 1.30 | never | 40.7% | ✗ | 10.1 | ok |
+| orb_vol_filtered | US30.cash | H1 | 57 | 0.58 | 0.88 | -0.16 | 32% | 1.70 | never | 5.9% | ✗ | 10.1 | ok |
+| orb_vol_filtered | UK100.cash | H1 | 56 | 0.56 | 0.55 | -0.37 | 25% | 1.62 | never | 2.5% | ✗ | 10.1 | ok |
+| vol_break_20 | US30.cash | M15 | 55 | 0.58 | 0.67 | -0.20 | 29% | 1.77 | never | 7.0% | ✗ | 10.1 | ok |
+| orb_vol_filtered | EURUSD | H1 | 52 | 0.74 | 0.82 | -0.09 | 35% | 1.66 | never | 2.3% | ✗ | 10.1 | ok |
+| orb_vol_filtered | XAUUSD | H1 | 44 | 0.66 | 0.76 | -0.08 | 34% | 1.71 | never | 14.5% | ✗ | 10.1 | ok |
+| orb_vol_filtered | JP225.cash | H1 | 43 | 1.05 | 0.71 | -0.26 | 28% | 1.71 | never | 6.4% | ✗ | 10.1 | ok |
+| vol_break_20 | US30.cash | H1 | 35 | 0.64 | 0.73 | -0.21 | 29% | 1.80 | never | 11.3% | ✗ | 10.0 | ok |
+| vol_break_20 | HK50.cash | M15 | 35 | 0.60 | 0.51 | -0.38 | 23% | 1.78 | never | 4.9% | ✗ | 10.0 | ok |
+| vol_break_20 | US100.cash | H1 | 34 | 0.83 | 0.98 | -0.10 | 32% | 1.80 | never | 7.3% | ✗ | 10.0 | ok |
+| orb_vol_filtered | HK50.cash | M15 | 32 | 1.66 | 0.65 | -0.26 | 28% | 1.69 | never | 2.9% | ✗ | 10.0 | ok |
+| vol_break_20 | JP225.cash | M15 | 29 | 0.89 | 0.95 | -0.04 | 34% | 1.79 | never | 4.2% | ✗ | 10.0 | ok |
+| orb_vol_filtered | XAUUSD | M15 | 27 | 0.69 | 0.87 | -0.11 | 33% | 1.70 | never | 2.4% | ✗ | 10.0 | ok |
+| orb_vol_filtered | EURUSD | M15 | 24 | 1.34 | 0.63 | -0.27 | 29% | 1.59 | never | 0.9% | ✗ | 10.0 | ok |
+| vol_break_20 | EURUSD | H1 | 24 | 0.68 | 0.47 | -0.44 | 21% | 1.77 | never | 3.4% | ✗ | 10.0 | ok |
+| vol_break_20 | GER40.cash | H1 | 24 | 1.09 | 0.84 | -0.08 | 33% | 1.78 | never | 2.8% | ✗ | 10.0 | ok |
+| vol_break_20 | FRA40.cash | H1 | 21 | 1.00 | 0.68 | -0.09 | 33% | 1.74 | never | 1.2% | ✗ | 10.0 | ok |
+| vol_break_20 | XAUUSD | H1 | 19 | 1.25 | 0.30 | -0.58 | 16% | 1.81 | never | 18.0% | ✗ | 10.0 | ok |
+| vol_break_20 | XAUUSD | M15 | 14 | 0.87 | 0.45 | -0.21 | 29% | 1.79 | never | 8.3% | ✗ | 10.0 | ok |
+| vwap_fade | FRA40.cash | H1 | 636 | 0.00 | 0.00 | +0.00 | 0% | 0.00 | 0d | 0.0% | ✗ | 0.0 | thin_after_split |

@@ -34,6 +34,12 @@ class EmaCrossParams:
     stop_atr_mult: float = 1.5
     target_atr_mult: float = 3.0   # → 2R reward when stop_atr_mult=1.5
     long_only: bool = False        # if True, ignore bearish crosses
+    # Higher-timeframe regime filter. 0 = off (legacy behaviour). When
+    # >0, a LONG signal only fires when close > EMA(regime_ema_period),
+    # SHORT only when close < EMA(regime_ema_period). Empirically the
+    # 200-EMA filter improved most trend cells in the 2026-05 sweep
+    # (e.g. donch55 XAUUSD H1 PF 1.45→1.65, ema12_26 HK50 M15 PF 1.83→2.19).
+    regime_ema_period: int = 0
 
 
 class EmaCross:
@@ -51,6 +57,8 @@ class EmaCross:
         ema_fast = ema(candles["close"], p.fast_period)
         ema_slow = ema(candles["close"], p.slow_period)
         atr = atr_wilder(candles, p.atr_period)
+        regime_ema = (ema(candles["close"], p.regime_ema_period)
+                       if p.regime_ema_period > 0 else None)
 
         # Cross detection on the CLOSE of bar i: previous bar fast<=slow,
         # this bar fast>slow. Signal fires AT bar i (entry at bar i's close).
@@ -66,8 +74,17 @@ class EmaCross:
             if atr_val <= 0:
                 continue
 
+            # Regime filter — close must be on the right side of the
+            # higher-TF EMA when the parameter is set.
+            if regime_ema is not None:
+                regime_val = float(regime_ema.iloc[i])
+                if pd.isna(regime_val):
+                    continue
+
             # LONG cross: was below-or-equal, now strictly above
             if f_prev <= s_prev and f_now > s_now:
+                if regime_ema is not None and entry <= regime_val:
+                    continue
                 stop = entry - p.stop_atr_mult * atr_val
                 target = entry + p.target_atr_mult * atr_val
                 if stop > 0:
@@ -78,6 +95,8 @@ class EmaCross:
                     ))
             # SHORT cross: was above-or-equal, now strictly below
             elif (not p.long_only) and f_prev >= s_prev and f_now < s_now:
+                if regime_ema is not None and entry >= regime_val:
+                    continue
                 stop = entry + p.stop_atr_mult * atr_val
                 target = entry - p.target_atr_mult * atr_val
                 if target > 0:

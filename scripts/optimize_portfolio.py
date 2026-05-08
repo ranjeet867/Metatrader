@@ -103,7 +103,7 @@ def _build_rr_aware(name: str):
         return [(
             "default",
             lambda lo: BBandsMeanRev(BBandsMeanRevParams(
-                period=20, num_std=2.0, long_only=lo)))]
+                bb_period=20, bb_k=2.0, long_only=lo)))]
     raise ValueError(f"unknown strategy {name}")
 
 
@@ -115,13 +115,29 @@ STRATEGY_NAMES = [
 
 
 def _ftmo_pass_rate(trades, risk_pct: float, *, n_iter: int = 2000,
-                    bars_per_day: int = 1) -> float | None:
-    """Bootstrap a P(pass) for this single strategy's OOS R distribution."""
+                    bars_per_day: int = 1, n_oos_bars: int = 0
+                    ) -> float | None:
+    """Bootstrap a P(pass) for this single strategy's OOS R distribution.
+
+    Pre-fix this had dimensionally-wrong math:
+        n_oos_days = len(trades) / bars_per_day
+        tp_day = len(trades) / n_oos_days  ⟹  bars_per_day  (constant)
+    Which made `tp_day` a function of the TF, not of the strategy's
+    actual trade frequency. P(pass) was reliable only by accident.
+
+    Fix: pass the OOS BAR count in. n_oos_days = bars / bars_per_day,
+    then tp_day = trades / days. Dimensionally correct.
+    """
     rs = np.array([t.r_multiple for t in trades], dtype=float)
     if rs.size == 0:
         return None
-    n_oos_days = max(1.0, len(trades) / max(0.05, bars_per_day))
-    tp_day = max(0.05, len(trades) / n_oos_days) if n_oos_days else 0.05
+    if n_oos_bars > 0 and bars_per_day > 0:
+        n_oos_days = max(1.0, n_oos_bars / float(bars_per_day))
+    else:
+        # Fallback: assume 1 bar = 1 trade (very conservative). Better
+        # than the old wrong math.
+        n_oos_days = max(1.0, float(len(trades)))
+    tp_day = max(0.05, len(trades) / n_oos_days)
     pool = [StrategyDist(
         name="x", symbol="x", r_multiples=rs,
         trades_per_day=tp_day,
@@ -143,8 +159,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--risk", type=float, default=0.5,
                      help="Per-trade risk percent for FTMO sim (default 0.5)")
-    ap.add_argument("--top", type=int, default=30,
-                     help="Top-N cells to surface in the report")
+    ap.add_argument("--top", type=int, default=1000,
+                     help="Top-N cells to surface in the report. Default "
+                          "1000 captures every survivor; set 0 for unlimited.")
     ap.add_argument("--tickers", default=None,
                      help="Comma-separated tickers (default: all parquets)")
     ap.add_argument("--tfs", default="M15,H1,D1",
@@ -155,6 +172,14 @@ def main() -> int:
                      help="Monte-Carlo iterations per cell")
     ap.add_argument("--require-sustained", action="store_true",
                      help="Drop cells that touched the FTMO -10% floor.")
+    ap.add_argument("--bidirectional", action="store_true",
+                     help="Run both long-only AND bidirectional sides for "
+                          "every cell. Doubles run time but surfaces FX "
+                          "and mean-reversion edges that long-only misses.")
+    ap.add_argument("--min-oos-trades", type=int, default=10,
+                     help="Drop cells with fewer than N out-of-sample trades. "
+                          "Default 10 — anything less is statistically "
+                          "unreliable. Set 3 for the loosest filter.")
     ap.add_argument("--out", default=None,
                      help="Output markdown path")
     args = ap.parse_args()
@@ -195,19 +220,36 @@ def main() -> int:
                     continue
                 bpd = _bars_per_day(tf)
 
-                for rr_label, factory in variants:
+                # Pick side(s) to sweep. Long-only default; bidirectional
+                # adds a second pass that also takes shorts.
+                sides_to_run: list[tuple[str, bool]] = [("long", True)]
+                if args.bidirectional:
+                    sides_to_run.append(("bidir", False))
+
+                # Cost-config + mpu pulled from the SAME source the
+                # rest of the codebase uses. Pre-fix this script
+                # hardcoded mpu=1.0 (so net_pnl across tickers wasn't
+                # comparable) and commission=3.0/slip=0.1 (mismatching
+                # rebaseline's $4 + 0.05). Now optimizer output is
+                # cross-ticker comparable AND consistent with v2.db.
+                from core import cost_defaults as _cd
+                from dashboards.components.state import resolve_money_per_unit
+                _mpu = resolve_money_per_unit(ticker)
+                for side_label, long_only in sides_to_run:
+                  for rr_label, factory in variants:
                     try:
-                        strat = factory(True)   # long-only
+                        strat = factory(long_only)
                         result = run_backtest(
                             df, strat.signals(df),
-                            starting_balance=100_000,
-                            lots=1.0, money_per_unit_price=1.0,
-                            commission_per_trade=3.0,
-                            slippage_per_fill_atr_frac=0.1,
+                            starting_balance=_cd.DEFAULT_STARTING_BALANCE_USD,
+                            lots=1.0, money_per_unit_price=_mpu,
+                            commission_per_trade=_cd.DEFAULT_COMMISSION_USD,
+                            slippage_per_fill_atr_frac=_cd.DEFAULT_SLIPPAGE_ATR_FRAC,
                             symbol=ticker,
                         )
                     except Exception as e:
-                        print(f"  skip {strategy_name} {ticker} {tf} {rr_label}: {e}")
+                        print(f"  skip {strategy_name} {ticker} {tf} "
+                                f"{rr_label} ({side_label}): {e}")
                         n_skipped += 1
                         continue
                     if not result.reconciles:
@@ -215,18 +257,31 @@ def main() -> int:
                         n_skipped += 1
                         continue
                     n_run += 1
-                    # Slice OOS portion (60/40)
+                    # Slice OOS portion (60/40). IMPORTANT: slice BOTH
+                    # trades and equity_curve to the OOS time range and
+                    # rebase the OOS curve to start at $100k. Without
+                    # this, max_dd / recovery / DDdays would describe
+                    # the full backtest (including train) while win%,
+                    # sum_realized describe OOS only — contradictory.
+                    from core.backtest_stats import slice_result_to_oos
                     split = int(len(df) * 0.6)
-                    oos_trades = [t for t in result.trades
-                                    if t.entry_bar_idx >= split]
-                    oos_result = dataclasses.replace(result, trades=oos_trades)
+                    oos_result = slice_result_to_oos(
+                        result, split_bar_idx=split, candles=df,
+                        rebase_to=100_000,
+                    )
+                    oos_trades = oos_result.trades
                     stats = compute_full_stats(oos_result, starting_balance=100_000)
-                    if stats.n_trades < 3:
-                        # too few OOS trades — skip
+                    if stats.n_trades < args.min_oos_trades:
+                        # Too few OOS trades — skip. With <10 trades the
+                        # statistics are noise; with <3 they're meaningless.
                         continue
+                    # Pass actual OOS bar count for dimensionally correct
+                    # tp_day calc inside _ftmo_pass_rate.
+                    n_oos_bars = max(1, len(df) - split)
                     p_pass = _ftmo_pass_rate(oos_trades, args.risk,
                                                 n_iter=args.ftmo_iter,
-                                                bars_per_day=bpd)
+                                                bars_per_day=bpd,
+                                                n_oos_bars=n_oos_bars)
                     sustained = is_sustained(result.equity_curve,
                                                 baseline=100_000)
 
@@ -251,6 +306,14 @@ def main() -> int:
                         score=score_cell(stats, p_pass=p_pass,
                                           sustained=sustained),
                         sustained=sustained,
+                        # Phase 2: $-amount fields on $100k baseline
+                        net_pnl_dollars=stats.sum_realized,
+                        max_dd_dollars=stats.max_dd_dollars,
+                        max_dd_days=stats.max_dd_duration_days,
+                        avg_win_dollars=stats.avg_win_dollars,
+                        avg_loss_dollars=stats.avg_loss_dollars,
+                        side=("long" if getattr(strat.params, "long_only", True)
+                              else "bidir"),
                     )
                     rows.append(cs)
 
@@ -258,7 +321,10 @@ def main() -> int:
     if args.require_sustained:
         rows = [r for r in rows if r.sustained]
     rows.sort(key=lambda r: r.score, reverse=True)
-    top = rows[: args.top]
+    # --top 0 = unlimited (write every survivor cell). Default 1000 so
+    # the markdown carries every row that passed the filters and the
+    # dashboard never falls back to grid_results.md for $-data.
+    top = rows if args.top == 0 else rows[: args.top]
 
     when = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     out_path = (Path(args.out) if args.out

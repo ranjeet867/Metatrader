@@ -234,3 +234,141 @@ class TestSizingResultBoolean:
         r = calc_lots(equity=0, risk_pct=1.0,
                        entry_price=100, stop_price=99, sym=US100)
         assert not r
+
+
+class TestMaxLotsCap:
+    """User-side max-lots cap (FTMO etc. allow far less than broker volume_max)."""
+
+    def _wide_open_sym(self):
+        return SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                            volume_step=0.1, volume_min=0.1,
+                            volume_max=1000.0, digits=0, contract_size=1)
+
+    def test_max_lots_clamps_below_volume_max(self):
+        sym = self._wide_open_sym()
+        # raw = 1000, volume_max = 1000, so without max_lots → 1000.
+        r = calc_lots(equity=1_000_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=15.0)
+        assert r.ok
+        assert r.lots == pytest.approx(15.0)
+
+    def test_max_lots_none_means_no_cap(self):
+        sym = self._wide_open_sym()
+        r = calc_lots(equity=100_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=None)
+        # Should fall back to volume_max only (raw = 100, well under 1000)
+        assert r.ok
+        assert r.lots == pytest.approx(100.0)
+
+    def test_max_lots_zero_means_no_cap(self):
+        sym = self._wide_open_sym()
+        r = calc_lots(equity=100_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=0.0)
+        assert r.ok
+        assert r.lots == pytest.approx(100.0)
+
+    def test_max_lots_does_nothing_when_lots_already_smaller(self):
+        sym = self._wide_open_sym()
+        r = calc_lots(equity=10_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=15.0)
+        # raw = 10 lots, well under 15
+        assert r.ok
+        assert r.lots == pytest.approx(10.0)
+
+    def test_max_lots_below_volume_min_rejects(self):
+        sym = SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                          volume_step=0.1, volume_min=0.5,
+                          volume_max=100.0, digits=0, contract_size=1)
+        r = calc_lots(equity=1_000_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=0.1)   # below volume_min of 0.5
+        assert not r.ok
+        assert r.reason == "max_lots_below_volume_min"
+
+
+class TestMaxMoneyRiskUsdCap:
+    """Hard $-ceiling per trade — the safety net against tight-stop blow-ups."""
+
+    def test_money_cap_clamps_lots_when_pct_says_more(self):
+        # equity 100k, risk 1% → $1000 budget
+        # but max_money_risk_usd = $200 → enforce $200 ceiling
+        sym = SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                          volume_step=0.1, volume_min=0.1,
+                          volume_max=1000.0, digits=0, contract_size=1)
+        r = calc_lots(equity=100_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_money_risk_usd=200.0)
+        assert r.ok
+        # money_per_lot at $10 stop = 10, $200 / 10 = 20 lots
+        assert r.lots == pytest.approx(20.0)
+        assert r.money_risk == pytest.approx(200.0)
+        # intended_risk should reflect the CAPPED amount
+        assert r.intended_risk == pytest.approx(200.0)
+
+    def test_money_cap_does_nothing_when_pct_already_smaller(self):
+        # equity 100k, risk 0.1% → $100 budget
+        # max_money_risk_usd = $500 (well above) → no effect
+        sym = SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                          volume_step=0.1, volume_min=0.1,
+                          volume_max=1000.0, digits=0, contract_size=1)
+        r = calc_lots(equity=100_000, risk_pct=0.1,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_money_risk_usd=500.0)
+        assert r.ok
+        assert r.lots == pytest.approx(10.0)        # $100/$10 = 10 lots
+        assert r.money_risk == pytest.approx(100.0)
+
+    def test_money_cap_zero_means_disabled(self):
+        sym = SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                          volume_step=0.1, volume_min=0.1,
+                          volume_max=1000.0, digits=0, contract_size=1)
+        r = calc_lots(equity=100_000, risk_pct=1.0,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_money_risk_usd=0.0)
+        assert r.ok
+        # Full $1000 budget → 100 lots
+        assert r.lots == pytest.approx(100.0)
+
+    def test_tight_stop_money_cap_protects_against_blowup(self):
+        """The exact gold-disaster scenario the user described.
+
+        XAUUSD: tick_size=0.01, tick_value=$1/lot.
+        Stop only 30 ticks (very tight). Without cap, 0.5% on $90k =
+        $450 budget / ($1 × 30) = 15 lots → 1 wrong lot in slippage =
+        $30 = 0.03% — 15 lots × 1 tick wrong = $30 × 15 = $450 / 0.5%.
+        Actually here the bigger risk is volatility AFTER entry — 100
+        ticks of slippage = $1500 = 1.7% on 15 lots.
+        With $300 cap → 10 lots → 100 ticks of slippage = $1000 = 1.1%."""
+        gold = SymbolInfo("XAUUSD", tick_size=0.01, tick_value=1.0,
+                           volume_step=0.01, volume_min=0.01,
+                           volume_max=100.0, digits=2, contract_size=100)
+        # WITHOUT cap
+        r_uncapped = calc_lots(equity=90_000, risk_pct=0.5,
+                                entry_price=2000.00, stop_price=2000.30,
+                                sym=gold, max_money_risk_usd=None)
+        assert r_uncapped.ok
+        assert r_uncapped.lots == pytest.approx(15.0, rel=0.01)
+        # WITH $300 cap
+        r_capped = calc_lots(equity=90_000, risk_pct=0.5,
+                              entry_price=2000.00, stop_price=2000.30,
+                              sym=gold, max_money_risk_usd=300.0)
+        assert r_capped.ok
+        assert r_capped.lots == pytest.approx(10.0, rel=0.01)
+        assert r_capped.money_risk == pytest.approx(300.0, abs=10.0)
+
+    def test_money_cap_combined_with_max_lots(self):
+        """Both caps can be active — whichever bites first wins."""
+        sym = SymbolInfo("X", tick_size=1.0, tick_value=1.0,
+                          volume_step=0.1, volume_min=0.1,
+                          volume_max=1000.0, digits=0, contract_size=1)
+        # Budget $500 → 50 lots; max_lots=15 → clamp to 15
+        # max_money_risk_usd=$100 → bites first → 10 lots
+        r = calc_lots(equity=100_000, risk_pct=0.5,
+                       entry_price=110, stop_price=100, sym=sym,
+                       max_lots=15.0, max_money_risk_usd=100.0)
+        assert r.ok
+        assert r.lots == pytest.approx(10.0)

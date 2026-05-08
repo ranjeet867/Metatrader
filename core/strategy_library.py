@@ -70,6 +70,29 @@ class LibraryEntry:
     def has_edge(self) -> bool:
         return self.edge is not None and self.edge.is_survivor
 
+    @property
+    def is_starred(self) -> bool:
+        """Show ⭐ in UIs only if the cell is in the curated list AND
+        passes every hard gate AND has enough OOS sample to be robust
+        across small split-method drift (n_test ≥ 20, not just ≥ 15).
+
+        Pre-fix the Library showed ⭐ on cells where the catalog's
+        n_test=16 passes the n_test ≥ 15 gate but the fresh Backtest's
+        OOS partition has 13 trades and fails. The user saw ⭐ AND
+        "FAILS gates" simultaneously. Tightening the threshold to 20
+        gives a buffer for split-method differences (catalog splits
+        by trade count, Backtest by bar index).
+        """
+        if not self.recommended:
+            return False
+        if self.edge is None:
+            return False
+        if not getattr(self.edge, "deploy_safe", True):
+            return False
+        if self.edge.n_test < 20:
+            return False
+        return True
+
 
 def list_library(*, only_with_edge: bool = False) -> list[LibraryEntry]:
     """Return the curated library, sorted recommended-first then by test_R desc."""
@@ -114,22 +137,71 @@ def list_library(*, only_with_edge: bool = False) -> list[LibraryEntry]:
 
 
 def to_dataframe(entries: list[LibraryEntry]):
-    """Pandas DataFrame for the Strategy Library table view."""
+    """Pandas DataFrame for the Strategy Library table view.
+
+    AlgoTest-style columns: every survivor surfaces R:R variant, max DD$,
+    DD-period in days, recovery time, avg win$, avg loss$, net P&L$ on
+    a $100k baseline.
+
+    A `confidence` column flags small-sample cells: ⚠ if n_test < 10
+    (statistically unreliable), ✓ if n_test ≥ 10. The threshold is the
+    same the optimizer uses to keep cells (--min-oos-trades).
+    """
     import pandas as pd
     rows = []
     for e in entries:
         es = e.edge
+        n = es.n_test if es else 0
+        # Confidence band: < 10 trades is too few to trust the statistic.
+        # 10–29 is moderate, 30+ is good.
+        if not es or n < 10:
+            confidence = "⚠ low"
+        elif n < 30:
+            confidence = "~ medium"
+        else:
+            confidence = "✓ high"
+        # Trendo zone — ✅/🟡/🔴 based on the WR × R:R profitability matrix
+        if es and es.win_rate_pct > 0 and es.rr_ratio > 0:
+            from core import trendo_matrix
+            ev = trendo_matrix.expectancy_per_R(es.win_rate_pct,
+                                                   es.rr_ratio)
+            zone_icon = {
+                "green": "✅", "amber": "🟡", "red": "🔴"
+            }[trendo_matrix.trendo_zone(es.win_rate_pct, es.rr_ratio)]
+            trendo_label = f"{zone_icon} {ev:+.2f}R"
+        else:
+            trendo_label = "—"
+        # ⭐ ONLY when the cell is curated-recommended AND deploy-safe
+        # AND has enough OOS sample. Without all three, the ⭐ misleads
+        # the user into clicking Backtest and seeing the cell get
+        # rejected by the hard gates — see is_starred docstring.
         rows.append({
-            "rec": "⭐" if e.recommended else "",
+            "rec": "⭐" if e.is_starred else
+                    ("📍" if e.recommended else ""),
+            "confidence": confidence,
+            "Trendo EV": trendo_label,
             "strategy": e.strategy,
             "ticker": e.ticker,
             "tf": e.tf,
-            "side": "long" if e.long_only else "bidir",
-            "n_test": es.n_test if es else None,
+            "side": (es.side if es and es.side else
+                     ("long" if e.long_only else "bidir")),
+            "R:R": (es.rr_label if es else "") or "—",
+            "n_test": n if es else None,
             "PF_test": round(es.test_pf, 2) if es else None,
             "R_test": round(es.test_r, 3) if es else None,
-            "PF_train": round(es.train_pf, 2) if es else None,
-            "R_train": round(es.train_r, 3) if es else None,
+            "win%": round(es.win_rate_pct, 1) if es else None,
+            "netPnL$": round(es.net_pnl_dollars) if es else None,
+            "maxDD%": round(es.max_dd_pct, 1) if es else None,
+            "maxDD$": round(es.max_dd_dollars) if es else None,
+            "DDdays": round(es.max_dd_days) if es else None,
+            "recovD": (None if not es else
+                       (None if es.recovery_days is None
+                        else round(es.recovery_days))),
+            "rr": round(es.rr_ratio, 2) if es and es.rr_ratio else None,
+            "avgWin$": round(es.avg_win_dollars) if es else None,
+            "avgLoss$": round(es.avg_loss_dollars) if es else None,
+            "P(pass)": (None if not es or es.p_pass_30d is None
+                        else f"{es.p_pass_30d*100:.0f}%"),
             "edge?": "✅" if (es and es.is_survivor) else "—",
             "why": e.why or "",
             "slug": e.slug,

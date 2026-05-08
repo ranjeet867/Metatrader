@@ -86,7 +86,7 @@ def render_top_band(data_index) -> None:
     cols[2].metric("🟡 aging", n_yellow)
     cols[3].metric("🔴 stale", n_red)
     if cols[4].button("🔄  Fetch ALL", type="primary",
-                       use_container_width=True,
+                       width="stretch",
                        help=f"Refresh all {n_total} parquets from the MT5 "
                             "bridge in one shot."):
         n_ok, n_tot = _fetch_all(data_index)
@@ -122,7 +122,7 @@ def render_per_ticker_grid(data_index) -> None:
             head[0].markdown(f"#### `{ticker}`")
             if head[1].button("⬇ Refresh all TFs",
                                 key=f"rfr_all_{ticker}",
-                                use_container_width=True):
+                                width="stretch"):
                 with st.spinner(f"Refreshing {ticker}…"):
                     for r in by_ticker[ticker]:
                         _refresh_one(r["ticker"], r["tf"], _silent=True)
@@ -157,7 +157,7 @@ def render_per_ticker_grid(data_index) -> None:
                     unsafe_allow_html=True,
                 )
                 if row[4].button("⬇", key=f"rfr_{r['ticker']}_{r['tf']}",
-                                    use_container_width=True,
+                                    width="stretch",
                                     help=f"Refresh {r['ticker']} {r['tf']}"):
                     with st.spinner(f"Fetching {r['ticker']} {r['tf']}…"):
                         _refresh_one(r["ticker"], r["tf"])
@@ -168,8 +168,98 @@ def render_per_ticker_grid(data_index) -> None:
 # Add a new ticker
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Preset ticker bundles — one-click fetch for asset-class groups
+# ---------------------------------------------------------------------------
+#
+# Symbol names match how FTMO MT5 servers list them. If your broker uses a
+# different prefix (e.g. WTI vs USOIL, GOLD vs XAUUSD), edit the constants
+# below or use the manual "Add a new ticker" form.
+PRESET_BUNDLES: dict[str, list[str]] = {
+    "🥇 Metals": [
+        "XAUUSD",   # Gold
+        "XAGUSD",   # Silver
+        "XPTUSD",   # Platinum (some brokers don't offer this)
+        "XPDUSD",   # Palladium
+    ],
+    "🛢 Energies": [
+        "USOIL",    # WTI Crude
+        "UKOIL",    # Brent Crude
+        "NATGAS",   # Nat gas (broker-dependent)
+    ],
+    "🇯🇵 🇭🇰 🇦🇺 Asian + Pacific indices": [
+        "JP225.cash",   # Nikkei 225
+        "HK50.cash",    # Hang Seng (HK)
+        "AU200.cash",   # ASX 200
+        # KOSPI is rarely offered on prop-firm MT5 servers; if your broker
+        # has it use "KOSPI200.cash" or the broker's exact symbol.
+    ],
+    "🇪🇺 EU indices": [
+        "GER40.cash", "EU50.cash", "UK100.cash", "FRA40.cash",
+        "ESP35.cash",
+    ],
+    "🇺🇸 US indices": [
+        "US100.cash", "US500.cash", "US30.cash", "US2000.cash",
+    ],
+    "💱 Major FX pairs": [
+        "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
+        "NZDUSD", "USDCAD", "USDCHF", "GBPJPY",
+    ],
+}
+
+
+def render_preset_fetch() -> None:
+    with st.expander("🎯  Quick-fetch preset bundles", expanded=False):
+        st.caption(
+            "One-click fetch a whole asset-class bundle. Symbols use the "
+            "FTMO MT5 naming convention. If your broker uses different "
+            "names, edit `PRESET_BUNDLES` in `dashboards/pages/6_💾_Data_Manager.py` "
+            "or use **Add a new ticker** below."
+        )
+        tf_for_preset = st.selectbox(
+            "timeframes to fetch (per bundle, all checked)",
+            options=["D1 only", "H1 + D1", "M15 + H1 + D1"],
+            index=1, key="preset_tf_choice",
+        )
+        chosen_tfs = {"D1 only": ["D1"],
+                       "H1 + D1": ["H1", "D1"],
+                       "M15 + H1 + D1": ["M15", "H1", "D1"]}[tf_for_preset]
+        for label, tickers in PRESET_BUNDLES.items():
+            cols = st.columns([3, 1])
+            cols[0].markdown(
+                f"**{label}** — `{', '.join(tickers)}`")
+            if cols[1].button(f"⬇ Fetch", key=f"preset_{label}",
+                                width="stretch"):
+                total = len(tickers) * len(chosen_tfs)
+                prog = st.progress(0.0,
+                                     text=f"Fetching {total} cells…")
+                done = ok_count = 0
+                fails: list[str] = []
+                for tk in tickers:
+                    for tf in chosen_tfs:
+                        done += 1
+                        prog.progress(done / total,
+                                        text=f"{tk} {tf} ({done}/{total})…")
+                        if _refresh_one(tk, tf, _silent=True):
+                            ok_count += 1
+                        else:
+                            fails.append(f"{tk} {tf}")
+                prog.empty()
+                if not fails:
+                    st.success(f"✓ Fetched all {total} ({label})")
+                else:
+                    st.warning(
+                        f"Fetched {ok_count}/{total}. Failed: "
+                        + ", ".join(fails)
+                        + ".  Most common cause: your broker uses a "
+                        "different symbol name. Try **Add a new ticker** "
+                        "with the exact name you see in MT5's Market Watch."
+                    )
+                st.rerun()
+
+
 def render_add_ticker_form() -> None:
-    with st.expander("➕  Add a new ticker", expanded=False):
+    with st.expander("➕  Add a new ticker (custom symbol)", expanded=False):
         with st.form("add_ticker_form"):
             cols = st.columns([3, 1, 1])
             ticker = cols[0].text_input(
@@ -227,7 +317,7 @@ def render_gap_analysis(data_index) -> None:
                     "note": "" if n_gaps == 0 else f"⚠️ {n_gaps} long-gaps",
                 })
         df_g = pd.DataFrame(rows)
-        st.dataframe(df_g, use_container_width=True,
+        st.dataframe(df_g, width="stretch",
                        height=min(400, 36 * (len(df_g) + 1)))
 
 
@@ -273,7 +363,7 @@ def render_bridge_latency_chart(db_path: Path) -> None:
                             plot_bgcolor="#0b1117",
                             paper_bgcolor="#0b1117",
                             font=dict(color="#cbd5e1"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +380,7 @@ def main() -> None:
     render_freshness_bar(data_index)
     st.markdown("")
     render_per_ticker_grid(data_index)
+    render_preset_fetch()
     render_add_ticker_form()
     render_gap_analysis(data_index)
     render_bridge_latency_chart(REPO / "data" / "v2.db")

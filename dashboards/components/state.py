@@ -68,12 +68,43 @@ def discover_data() -> dict[str, dict[str, Path]]:
 
 
 # Per-ticker money_per_unit_USD_per_lot defaults (mirrors scripts/sweep_grid.py)
+# Indices = $1/pt, FX majors = $100k/lot at 1.0, gold/silver = $100/$ etc.
+# When a ticker isn't in this dict, resolve_money_per_unit() falls back to
+# data/symbol_info.json — that's the right source for XAUUSD/XAGUSD/XPDUSD/
+# stocks etc. that we didn't pre-populate here.
 DEFAULT_MONEY_PER_UNIT: dict[str, float] = {
     "US100.cash": 1.0, "US500.cash": 1.0, "GER40.cash": 1.0,
     "EU50.cash":  1.10,
     "EURUSD": 100_000.0, "GBPUSD": 100_000.0, "AUDUSD": 100_000.0,
     "NZDUSD": 100_000.0, "USDJPY": 700.0, "GBPJPY": 700.0,
 }
+
+
+def resolve_money_per_unit(ticker: str) -> float:
+    """Return the correct $-per-1.0-price-unit per lot for a ticker.
+
+    Priority:
+      1. Hand-tuned DEFAULT_MONEY_PER_UNIT (indices + FX majors)
+      2. Auto-derived from data/symbol_info.json:
+         money_per_unit = tick_value / tick_size  (broker-reported)
+      3. Fallback to 1.0 (warns implicitly via wrong P&L)
+
+    Use this EVERYWHERE money_per_unit_price is needed instead of
+    `DEFAULT_MONEY_PER_UNIT.get(t, 1.0)` — the .get(..., 1.0) silently
+    underprices XAUUSD/XAGUSD/XPDUSD/stocks by 100×, making cost-priced
+    backtests look fake-bad and dynamic sizing produce tiny lots.
+    """
+    if ticker in DEFAULT_MONEY_PER_UNIT:
+        return DEFAULT_MONEY_PER_UNIT[ticker]
+    # Auto-load from symbol_info.json — same tick math as the broker
+    try:
+        from core.symbol_info_loader import try_load
+        si = try_load(ticker)
+        if si is not None and si.tick_size > 0 and si.tick_value > 0:
+            return si.tick_value / si.tick_size
+    except Exception:
+        pass
+    return 1.0
 DEFAULT_LOTS: dict[str, float] = {
     "US100.cash": 6.5, "US500.cash": 20.0, "GER40.cash": 3.0,
     "EU50.cash": 20.0,

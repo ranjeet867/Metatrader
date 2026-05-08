@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GRID_PATH = REPO_ROOT / "docs" / "grid_results.md"
+DEFAULT_DB_PATH = REPO_ROOT / "data" / "v2.db"
 
 
 def _latest_optimization_path() -> Path | None:
@@ -36,6 +37,83 @@ class EdgeStat:
     n_test: int
     test_pf: float
     test_r: float
+    # Phase 2: AlgoTest-style depth from optimizer wide format. All
+    # values are out-of-sample on a $100k baseline. Defaults to 0 / ""
+    # when reading legacy 9-col grid_results.md or short-format tables.
+    rr_label: str = ""              # '1:1', '1:2 wide', 'default', etc.
+    side: str = "long"              # 'long' | 'short' | 'bidir'
+    win_rate_pct: float = 0.0
+    net_pnl_dollars: float = 0.0
+    max_dd_pct: float = 0.0
+    max_dd_dollars: float = 0.0
+    max_dd_days: float = 0.0
+    recovery_days: float | None = None
+    max_consec_losses: int = 0
+    rr_ratio: float = 0.0
+    avg_win_dollars: float = 0.0
+    avg_loss_dollars: float = 0.0
+    cagr_pct: float | None = None
+    p_pass_30d: float | None = None
+    sustained: bool = True
+    score: float = 0.0
+    # ── Hard gates ─────────────────────────────────────────────────
+    # Reasons this cell would FAIL deployment quality checks. Empty
+    # tuple = populates passes all gates and is safe to deploy. Populated by
+    # _evaluate_hard_gates() — Composer / Backtest UIs read this to
+    # block Recommended preset inclusion + show a 🚫 banner.
+    hard_gate_failed: tuple[str, ...] = ()
+    # ── Full config for re-running ─────────────────────────────────
+    # The exact JSON config string that produced this catalog row's
+    # metrics. Used by Composer→Backtest deep-links: passing JUST the
+    # variant name (e.g. 'rsi_30_70') doesn't capture stop/target
+    # atr_mults, so a fresh backtest can run with different R:R than
+    # the catalog and produce mismatched numbers. Embedding the full
+    # config in the URL lets the Backtest page reproduce the exact
+    # metrics. Empty string = no config (legacy markdown source).
+    source_config_json: str = ""
+
+    @property
+    def trendo_zone(self) -> str:
+        """Trendo R:R × Win-Rate zone: 'green' | 'amber' | 'red'.
+
+        green = EV per trade > 0.05R (solidly profitable)
+        amber = within ±0.05R of break-even
+        red   = EV per trade < -0.05R (not viable long-run)
+        """
+        from core import trendo_matrix
+        return trendo_matrix.trendo_zone(self.win_rate_pct, self.rr_ratio)
+
+    @property
+    def expectancy_per_R(self) -> float:
+        """EV per trade in R units. Positive = profitable in long run."""
+        from core import trendo_matrix
+        return trendo_matrix.expectancy_per_R(self.win_rate_pct,
+                                                 self.rr_ratio)
+
+    @property
+    def is_trendo_profitable(self) -> bool:
+        """True iff this cell satisfies the EV > 0 criterion."""
+        return self.expectancy_per_R > 0.0
+
+    @property
+    def trades_per_month(self) -> float | None:
+        """Approximate trades/month using the OOS span typical for this TF.
+        OOS = 40% of total parquet history; D1 ≈ 5y → 2y OOS, H1 ≈ 1.5y →
+        0.6y OOS, M15 ≈ 4mo → 1.6mo OOS. These match observed parquet
+        distributions in our data/ directory."""
+        if self.n_test <= 0:
+            return None
+        oos_months = {
+            "D1":  24.0,    # ~2 years
+            "H1":  7.0,     # ~7 months
+            "M15": 1.6,     # ~1.6 months
+        }.get(self.tf)
+        return (self.n_test / oos_months) if oos_months else None
+
+    @property
+    def trades_per_day(self) -> float | None:
+        tpm = self.trades_per_month
+        return (tpm / 21.0) if tpm else None     # 21 trading days/month
 
     @property
     def total_trades(self) -> int:
@@ -47,34 +125,191 @@ class EdgeStat:
                 and self.train_r > 0 and self.test_r > 0
                 and self.n_test >= 5)
 
+    @property
+    def deploy_safe(self) -> bool:
+        """True iff the cell passes ALL hard gates — safe for live.
+
+        Used by Composer's Recommended preset + the Backtest page's
+        🚫 banner. A cell with `recovery_days=None` (still in its
+        first drawdown) or a negative TEST partition is NOT deploy-
+        safe even if its overall score looks good — the score formula
+        can be inflated by uncosted source rows.
+        """
+        return len(self.hard_gate_failed) == 0
+
+
+# Hard-gate thresholds — single source of truth. Tweak these in one
+# place and Composer + Backtest banner pick it up automatically.
+#
+# Recovery gate is now strategy-kind aware (Path A from the TSMOM memo):
+# trend strategies have characteristic 6-12 month drawdowns per AQR's
+# published research (Moskowitz/Ooi/Pedersen 2012, Hurst/Ooi/Pedersen
+# 2017). A 90-day gate is correct for mean-reversion / breakout cells
+# but wrongly rejects trend strategies' inherent drawdown profile.
+HARD_GATE_THRESHOLDS = {
+    "min_overall_pf":      1.05,
+    "min_test_pf":         1.00,
+    "min_test_avg_r":      0.00,
+    "max_recovery_days":   90.0,    # default for meanrev/breakout
+    "max_recovery_days_trend": 180.0,  # AQR-aligned for trend
+    "min_n_test":          15,
+}
+
+
+# Mapping from strategy-name prefix → kind. Used by _strategy_kind() to
+# auto-classify cells without requiring an explicit tag in the catalog.
+# Keep this short and unambiguous; new strategies declare their kind
+# here. Anything not listed defaults to "meanrev" (the strict gate).
+_STRATEGY_KIND_BY_PREFIX: dict[str, str] = {
+    # Trend / momentum — wider drawdown gate (180d)
+    "tsmom":              "trend",
+    "ema_cross":          "trend",
+    "ema_pullback":       "trend",
+    "trend_pullback":     "trend",
+    "donchian":           "trend",
+    "vol_break":          "trend",
+    # Mean-reversion — strict gate (90d)
+    "rsi":                "meanrev",
+    "rsi_30_70":          "meanrev",
+    "bbands":             "meanrev",
+    "vwap_fade":          "meanrev",
+    # Breakout — strict gate (90d). Range-expansion can recover faster.
+    "orb":                "breakout",
+    "orb_vol_filtered":   "breakout",
+    "range_reversal":     "meanrev",
+    "ibs":                "meanrev",
+    "first30_meanrev":    "meanrev",
+    "inside_bar":         "breakout",
+    "overnight_drift":    "trend",
+    "vol_breakout":       "trend",
+}
+
+
+def _strategy_kind(strategy_name: str) -> str:
+    """Classify a strategy by name prefix. Returns 'trend', 'meanrev',
+    or 'breakout'. Default 'meanrev' (strict gate) for unknown names."""
+    sname = (strategy_name or "").lower()
+    # Try exact match first, then prefix
+    if sname in _STRATEGY_KIND_BY_PREFIX:
+        return _STRATEGY_KIND_BY_PREFIX[sname]
+    for prefix, kind in _STRATEGY_KIND_BY_PREFIX.items():
+        if sname.startswith(prefix):
+            return kind
+    return "meanrev"
+
+
+def _evaluate_hard_gates(
+    *, overall_pf: float, test_pf: float, test_r: float,
+    recovery_days: float | None, n_test: int,
+    strategy_name: str = "",
+) -> tuple[str, ...]:
+    """Return tuple of human-readable reasons this cell fails the
+    quality gates. Empty tuple = passes all gates."""
+    t = HARD_GATE_THRESHOLDS
+    reasons: list[str] = []
+    if overall_pf < t["min_overall_pf"]:
+        reasons.append(
+            f"overall PF {overall_pf:.2f} < {t['min_overall_pf']} "
+            f"(barely break-even)"
+        )
+    if test_pf < t["min_test_pf"]:
+        reasons.append(
+            f"TEST partition PF {test_pf:.2f} < {t['min_test_pf']} "
+            f"(out-of-sample failure)"
+        )
+    if test_r < t["min_test_avg_r"]:
+        reasons.append(
+            f"TEST avg_R {test_r:+.3f} < {t['min_test_avg_r']:+.2f} "
+            f"(out-of-sample expectancy negative)"
+        )
+    # Strategy-kind-aware recovery gate. Trend strategies (TSMOM,
+    # donchian, ema_cross etc.) have characteristic 6-12 month
+    # drawdowns by construction — AQR's published Calmar of 0.5-0.8
+    # implies that. Use a 180d gate for trend, 90d for everything
+    # else. None ("not yet") still fails regardless.
+    kind = _strategy_kind(strategy_name)
+    max_rec = (t["max_recovery_days_trend"] if kind == "trend"
+                  else t["max_recovery_days"])
+    if recovery_days is None:
+        reasons.append(
+            "Recovery: not yet — cell currently underwater, never "
+            "climbed back to its drawdown peak"
+        )
+    elif recovery_days > max_rec:
+        reasons.append(
+            f"Recovery {recovery_days:.0f}d > "
+            f"{max_rec:.0f}d ({kind} gate) "
+            f"(too slow to bounce back during FTMO challenge)"
+        )
+    if n_test < t["min_n_test"]:
+        reasons.append(
+            f"OOS sample n_test={n_test} < {t['min_n_test']} "
+            f"(statistical noise dominates)"
+        )
+    return tuple(reasons)
+
 
 _NUM_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+
+
+def _safe_float(s: str, default: float = 0.0) -> float:
+    """Parse a numeric cell that may have $, commas, +/-, or 'inf' in it."""
+    if not s:
+        return default
+    s = s.strip().replace(",", "").replace("$", "")
+    if "inf" in s.lower():
+        return float("inf")
+    m = _NUM_RE.search(s)
+    return float(m.group()) if m else default
+
+
+def _safe_int(s: str, default: int = 0) -> int:
+    if not s:
+        return default
+    m = _NUM_RE.search(s.strip())
+    return int(float(m.group())) if m else default
+
+
+def _safe_pct(s: str) -> float | None:
+    """Parse a percentage like '12%' or '—'. Returns None for em-dash."""
+    s = s.strip()
+    if not s or s in {"—", "-", "n/a", "—%"}:
+        return None
+    m = _NUM_RE.search(s)
+    return (float(m.group()) / 100.0) if m else None
 
 
 def _parse_md_table(md_text: str) -> list[EdgeStat]:
     """Parse any | ticker | tf | strategy | … | tables in the markdown.
 
-    Supports two layouts:
-      • grid_results.md      9-col   ticker, tf, strategy, n_train,
-                                       train_PF, train_R, n_test,
-                                       test_PF, test_R
-      • optimization_*.md   17-col   rank, strategy, ticker, tf, R:R, n,
-                                       PF, R, win%, maxDD%, recov_d,
-                                       streak, rr, CAGR, P(pass), sus, score
-                              — only test_pf, test_r, n filled; train_*
-                              defaulted to OOS values so survivor logic
-                              still works.
+    Supports three layouts:
+      • grid_results.md      9-col    ticker, tf, strategy, n_train,
+                                        train_PF, train_R, n_test,
+                                        test_PF, test_R
+      • optimization_*.md   17-col   (legacy) rank, strategy, ticker, tf,
+                                        R:R, n, PF, R, win%, maxDD%,
+                                        recov_d, streak, rr, CAGR,
+                                        P(pass), sus, score
+      • optimization_*.md   23-col   (wide) rank, strategy, ticker, tf,
+                                        side, R:R, n, PF, R, win%,
+                                        netPnL$, maxDD%, maxDD$, DDdays,
+                                        recovD, streak, rr, avgWin$,
+                                        avgLoss$, CAGR, P(pass), sus, score
+
+    train_pf / train_r are filled with the OOS values for optimization
+    formats so the survivor logic still works.
     """
     out: list[EdgeStat] = []
     in_table = False
-    layout: str | None = None    # 'grid' | 'opt'
-    header_cells: list[str] = []
+    layout: str | None = None    # 'grid' | 'opt' | 'opt_wide'
     for line in md_text.splitlines():
         if line.startswith("|") and "ticker" in line and "tf" in line:
             header_cells = [c.strip().lower()
                              for c in line.strip("|").split("|")]
-            # Optimization layout starts with 'rank' before strategy
-            layout = "opt" if header_cells[0] == "rank" else "grid"
+            if header_cells[0] == "rank":
+                layout = "opt_wide" if "side" in header_cells else "opt"
+            else:
+                layout = "grid"
             in_table = True
             continue
         if in_table and line.startswith("|---"):
@@ -87,64 +322,585 @@ def _parse_md_table(md_text: str) -> list[EdgeStat]:
             try:
                 if layout == "grid" and len(cells) >= 9:
                     tic, tf, strat, n_tr, tr_pf, tr_r, n_te, te_pf, te_r = cells[:9]
+                    n_test_v = _safe_int(n_te)
+                    test_pf_v = _safe_float(te_pf)
+                    test_r_v = _safe_float(te_r)
+                    train_pf_v = _safe_float(tr_pf)
+                    # Grid format doesn't carry recovery_days, so pass
+                    # None → gate evaluator flags it as "currently
+                    # underwater" (conservative default). If the cell
+                    # was actually recovered, re-baseline via v2.db
+                    # produces a row with the real recovery number.
+                    grid_gates = _evaluate_hard_gates(
+                        overall_pf=train_pf_v if train_pf_v > 0 else test_pf_v,
+                        test_pf=test_pf_v,
+                        test_r=test_r_v,
+                        recovery_days=None,
+                        n_test=n_test_v,
+                        strategy_name=strat.strip("` "),
+                    )
                     out.append(EdgeStat(
-                        ticker=tic, tf=tf, strategy=strat,
-                        n_train=int(_NUM_RE.search(n_tr).group()),
-                        train_pf=float(_NUM_RE.search(tr_pf).group()),
-                        train_r=float(_NUM_RE.search(tr_r).group()),
-                        n_test=int(_NUM_RE.search(n_te).group()),
-                        test_pf=float(_NUM_RE.search(te_pf).group()),
-                        test_r=float(_NUM_RE.search(te_r).group()),
+                        ticker=tic.strip("` "), tf=tf.strip("` "),
+                        strategy=strat.strip("` "),
+                        n_train=_safe_int(n_tr),
+                        train_pf=train_pf_v,
+                        train_r=_safe_float(tr_r),
+                        n_test=n_test_v,
+                        test_pf=test_pf_v,
+                        test_r=test_r_v,
+                        hard_gate_failed=grid_gates,
+                    ))
+                elif layout == "opt_wide" and len(cells) >= 23:
+                    # rank | strategy | ticker | tf | side | R:R | n | PF | R
+                    # | win% | netPnL$ | maxDD% | maxDD$ | DDdays | recovD
+                    # | streak | rr | avgWin$ | avgLoss$ | CAGR | P(pass)
+                    # | sus | score |
+                    (_, strat, tic, tf, side, rr_lbl, n, pf, r, winp,
+                     net_pnl, dd_pct, dd_d, dd_days, recov, streak,
+                     rr_ratio, avg_w, avg_l, cagr, ppass, sus,
+                     score) = cells[:23]
+                    n_test = _safe_int(n)
+                    test_pf = _safe_float(pf)
+                    test_r = _safe_float(r)
+                    parsed_recovery = (None if "—" in recov
+                                          else _safe_float(recov))
+                    parsed_score = _safe_float(score)
+                    gates_failed = _evaluate_hard_gates(
+                        overall_pf=test_pf, test_pf=test_pf,
+                        test_r=test_r, recovery_days=parsed_recovery,
+                        n_test=n_test,
+                        strategy_name=strat.strip("` "),
+                    )
+                    if gates_failed:
+                        parsed_score = min(parsed_score, 15.0)
+                    out.append(EdgeStat(
+                        ticker=tic.strip("` "), tf=tf.strip("` "),
+                        strategy=strat.strip("` "),
+                        n_train=n_test, train_pf=test_pf, train_r=test_r,
+                        n_test=n_test, test_pf=test_pf, test_r=test_r,
+                        rr_label=rr_lbl.strip("` "),
+                        side=side.strip("` ") or "long",
+                        win_rate_pct=_safe_float(winp),
+                        net_pnl_dollars=_safe_float(net_pnl),
+                        max_dd_pct=_safe_float(dd_pct),
+                        max_dd_dollars=_safe_float(dd_d),
+                        max_dd_days=_safe_float(dd_days),
+                        recovery_days=parsed_recovery,
+                        max_consec_losses=_safe_int(streak),
+                        rr_ratio=_safe_float(rr_ratio),
+                        avg_win_dollars=_safe_float(avg_w),
+                        avg_loss_dollars=_safe_float(avg_l),
+                        cagr_pct=(None if "—" in cagr
+                                   else _safe_float(cagr)),
+                        p_pass_30d=_safe_pct(ppass),
+                        sustained=("✅" in sus),
+                        score=parsed_score,
+                        hard_gate_failed=gates_failed,
                     ))
                 elif layout == "opt" and len(cells) >= 8:
-                    # rank | strategy | ticker | tf | R:R | n | PF | R | …
-                    _, strat, tic, tf, _rr, n, pf, r = cells[:8]
-                    # Cells are wrapped in backticks in the markdown
-                    strat = strat.strip("` ")
-                    tic = tic.strip("` ")
-                    tf = tf.strip("` ")
-                    n_test = int(_NUM_RE.search(n).group())
-                    test_pf = (5.0 if "inf" in pf
-                                else float(_NUM_RE.search(pf).group()))
-                    test_r = float(_NUM_RE.search(r).group())
-                    out.append(EdgeStat(
-                        ticker=tic, tf=tf,
-                        strategy=strat,
-                        n_train=n_test,        # optimizer reports OOS only
-                        train_pf=test_pf,
-                        train_r=test_r,
+                    # Legacy 17-col format
+                    _, strat, tic, tf, rr_lbl, n, pf, r = cells[:8]
+                    n_test = _safe_int(n)
+                    test_pf = _safe_float(pf)
+                    test_r = _safe_float(r)
+                    # Same conservative-default gate eval as grid layout
+                    # — recovery_days is unknown, treat as not-recovered.
+                    opt_gates = _evaluate_hard_gates(
+                        overall_pf=test_pf, test_pf=test_pf,
+                        test_r=test_r, recovery_days=None,
                         n_test=n_test,
-                        test_pf=test_pf,
-                        test_r=test_r,
+                        strategy_name=strat.strip("` "),
+                    )
+                    out.append(EdgeStat(
+                        ticker=tic.strip("` "), tf=tf.strip("` "),
+                        strategy=strat.strip("` "),
+                        n_train=n_test, train_pf=test_pf, train_r=test_r,
+                        n_test=n_test, test_pf=test_pf, test_r=test_r,
+                        rr_label=rr_lbl.strip("` "),
+                        hard_gate_failed=opt_gates,
                     ))
-            except (AttributeError, ValueError):
+            except (AttributeError, ValueError, IndexError):
                 continue
     return out
 
 
-def load_catalog(path: Path | None = None) -> dict[tuple[str, str], list[EdgeStat]]:
+def _variant_name_from_config(strategy_name: str, config_json: str) -> str:
+    """Map a base strategy + params to its canonical variant label
+    so v2.db rows match the optimization markdown's naming.
+
+    Examples:
+      ema_cross + {fast=9, slow=20}    → 'ema_cross_9_20'
+      ema_cross + {fast=12, slow=26}   → 'ema_cross_12_26'
+      donchian_breakout + {period=55}  → 'donchian_55'
+      rsi_meanrev + {oversold=30, ...} → 'rsi_30_70'
+      bbands_meanrev + {bb_period=20}  → 'bbands_20_2'
+      anything else                    → strategy_name (unchanged)
+    """
+    import json
+    try:
+        cfg = json.loads(config_json)
+    except (ValueError, TypeError):
+        return strategy_name
+    if strategy_name == "ema_cross":
+        f, s = cfg.get("fast_period"), cfg.get("slow_period")
+        if f and s:
+            return f"ema_cross_{int(f)}_{int(s)}"
+    if strategy_name == "donchian_breakout":
+        p = cfg.get("period")
+        if p:
+            return f"donchian_{int(p)}"
+    if strategy_name == "rsi_meanrev":
+        os_, ob = cfg.get("oversold"), cfg.get("overbought")
+        if os_ and ob:
+            return f"rsi_{int(os_)}_{int(ob)}"
+    if strategy_name == "bbands_meanrev":
+        bp, bk = cfg.get("bb_period"), cfg.get("bb_k")
+        if bp and bk:
+            return f"bbands_{int(bp)}_{int(bk)}"
+    if strategy_name == "ema_pullback":
+        f, s = cfg.get("fast_period"), cfg.get("slow_period")
+        if f and s:
+            return f"ema_pullback_{int(f)}_{int(s)}"
+    return strategy_name
+
+
+def _rr_label_from_config(config_json: str) -> str:
+    """Derive an R:R label like '1:1.5' from stop_atr_mult / target_atr_mult."""
+    import json
+    try:
+        cfg = json.loads(config_json)
+    except (ValueError, TypeError):
+        return ""
+    sm = cfg.get("stop_atr_mult")
+    tm = cfg.get("target_atr_mult")
+    tr = cfg.get("target_R_mult")    # ema_pullback uses this
+    if sm and tm:
+        rr = round(tm / sm, 2)
+    elif tr:
+        rr = round(float(tr), 2)
+    else:
+        return ""
+    if abs(rr - round(rr)) < 0.05:
+        return f"1:{int(round(rr))}"
+    return f"1:{rr:.1f}"
+
+
+def _load_from_v2db(db_path: Path) -> list[EdgeStat]:
+    """Discover all backtest cells from data/v2.db. For each unique
+    (symbol, tf, variant_name) we keep ONLY the latest run (most recent
+    started_at_utc) so re-running a backtest replaces the old metrics.
+
+    This is what makes the dashboards auto-update after run_backtest.py:
+    Composer, Strategy Compare, Strategy Library all call load_catalog()
+    which now includes everything in v2.db without needing to regenerate
+    docs/optimization_*.md."""
+    import sqlite3
+    if not db_path.exists():
+        return []
+    out: list[EdgeStat] = []
+    try:
+        with sqlite3.connect(str(db_path)) as c:
+            c.row_factory = sqlite3.Row
+            # Pull the LATEST backtest run for each (symbol, tf, strategy_name, config_json)
+            rows = c.execute("""
+                SELECT r.run_id, r.symbol, r.tf, r.strategy_name,
+                       r.config_json, r.n_trades, r.starting_balance,
+                       r.sum_realized_pnl
+                FROM runs r
+                WHERE r.n_trades IS NOT NULL AND r.n_trades > 0
+                  AND r.reconciles = 1
+                ORDER BY r.started_at_utc DESC
+            """).fetchall()
+            seen_keys: set[tuple] = set()
+            for row in rows:
+                # PER-ROW try/except — pre-fix the entire `_load_from_v2db`
+                # was wrapped in one big `except Exception: return []`,
+                # so a single bad row could silently zero the whole catalog.
+                # Now one bad row only loses itself; everything else loads.
+                try:
+                    # variant + R:R derived from config so we match catalog naming
+                    variant = _variant_name_from_config(
+                        row["strategy_name"], row["config_json"])
+                    rr_label = _rr_label_from_config(row["config_json"])
+                    key = (row["symbol"], row["tf"], variant, rr_label)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    # Aggregate trade-level metrics
+                    trade_rows = c.execute("""
+                        SELECT realized_pnl, r_multiple, opened_at_utc, closed_at_utc
+                        FROM trades WHERE run_id = ?
+                    """, (row["run_id"],)).fetchall()
+                    if not trade_rows:
+                        continue
+                    n = len(trade_rows)
+                    # CANONICAL win/loss buckets — pre-fix two paths
+                    # disagreed on whether $0 PnL trades are losses or
+                    # scratches. We pick: > 0 win, < 0 loss, == 0 scratch
+                    # (excluded from PF math, counted as a no-op trade).
+                    wins = [t for t in trade_rows if (t["realized_pnl"] or 0) > 0]
+                    losses = [t for t in trade_rows if (t["realized_pnl"] or 0) < 0]
+                    n_wins = len(wins)
+                    n_losses = len(losses)
+                    gw = sum((t["realized_pnl"] or 0) for t in wins)
+                    gl = -sum((t["realized_pnl"] or 0) for t in losses)
+                    # PF math: keep proper float('inf') when no losses
+                    # AND there are real wins; otherwise the score formula
+                    # treats it explicitly. The PRIOR magic 99.0 cap let
+                    # a 17-trade run with 17 wins / 0 losses pass every
+                    # gate trivially because PF clamped to 99.
+                    if gl > 0:
+                        pf = gw / gl
+                    elif gw > 0:
+                        pf = float("inf")
+                    else:
+                        pf = 0.0
+                    avg_r = (sum((t["r_multiple"] or 0) for t in trade_rows) / n
+                                if n else 0.0)
+                    wr = n_wins / n * 100.0 if n else 0.0
+                    # Train/test split — use 60/40 by trade INDEX. We
+                    # compute proper TRAIN partition stats too, not just
+                    # set train_pf = overall_pf (which made `is_survivor`
+                    # a meaningless dual-gate). Now train_pf and test_pf
+                    # are independent measurements; a cell with great
+                    # train but bad test correctly fails is_survivor.
+                    split = int(n * 0.6)
+                    train_rows = trade_rows[:split]
+                    test_trades = trade_rows[split:]
+                    test_n = len(test_trades)
+                    train_n = len(train_rows)
+                    # Train metrics (parallel to test calc)
+                    train_wins = [t for t in train_rows
+                                    if (t["realized_pnl"] or 0) > 0]
+                    train_losses = [t for t in train_rows
+                                      if (t["realized_pnl"] or 0) < 0]
+                    train_gw = sum((t["realized_pnl"] or 0) for t in train_wins)
+                    train_gl = -sum((t["realized_pnl"] or 0) for t in train_losses)
+                    if train_gl > 0:
+                        train_pf = train_gw / train_gl
+                    elif train_gw > 0:
+                        train_pf = float("inf")
+                    else:
+                        train_pf = 0.0
+                    train_r = (sum((t["r_multiple"] or 0) for t in train_rows)
+                                  / train_n) if train_n else 0.0
+                    # Test metrics
+                    test_wins = [t for t in test_trades
+                                    if (t["realized_pnl"] or 0) > 0]
+                    test_losses = [t for t in test_trades
+                                      if (t["realized_pnl"] or 0) < 0]
+                    test_gw = sum((t["realized_pnl"] or 0) for t in test_wins)
+                    test_gl = -sum((t["realized_pnl"] or 0) for t in test_losses)
+                    if test_gl > 0:
+                        test_pf = test_gw / test_gl
+                    elif test_gw > 0:
+                        test_pf = float("inf")
+                    else:
+                        test_pf = 0.0
+                    test_r = (sum((t["r_multiple"] or 0) for t in test_trades)
+                                  / test_n) if test_n else 0.0
+                    # Streak of consecutive losses
+                    max_streak = 0
+                    cur = 0
+                    for t in trade_rows:
+                        if (t["realized_pnl"] or 0) < 0:
+                            cur += 1
+                            max_streak = max(max_streak, cur)
+                        else:
+                            cur = 0
+                    side = "long"
+                    avg_w = (gw / n_wins if n_wins else 0.0)
+                    avg_l = (-gl / n_losses if n_losses else 0.0)
+                    rr_ratio = (avg_w / abs(avg_l)) if avg_l else 0.0
+                    start_bal = row["starting_balance"] or 100_000.0
+                    net = row["sum_realized_pnl"] or 0.0
+
+                    # Compute equity curve from trades for DD + recovery
+                    # (the backtest stored summary stats but not the curve)
+                    running_eq = start_bal
+                    eq_series: list[tuple[str, float]] = []
+                    for t in trade_rows:
+                        running_eq += (t["realized_pnl"] or 0)
+                        eq_series.append((t["closed_at_utc"] or "",
+                                           running_eq))
+                    # Drawdown picture — track peak_at_max_dd separately
+                    # from the running peak. Pre-fix `peak_idx` always
+                    # pointed to the LATEST high; recovery_days then
+                    # searched for re-attaining that latest high after
+                    # the deepest trough — wrong if a new peak came
+                    # AFTER the deepest DD. Now we capture which peak
+                    # ACTUALLY led to the max DD and recover to that
+                    # specific level.
+                    max_dd_dollars = 0.0
+                    max_dd_pct = 0.0
+                    peak = start_bal
+                    trough_idx = -1
+                    peak_at_max_dd = start_bal
+                    peak_idx_at_max_dd = -1
+                    peak_idx = -1   # running latest peak (for tracking)
+                    for i, (_, eq) in enumerate(eq_series):
+                        if eq > peak:
+                            peak = eq
+                            peak_idx = i
+                        dd = peak - eq
+                        if dd > max_dd_dollars:
+                            max_dd_dollars = dd
+                            max_dd_pct = dd / peak * 100 if peak else 0
+                            trough_idx = i
+                            peak_at_max_dd = peak           # ← snapshot
+                            peak_idx_at_max_dd = peak_idx   # ← snapshot
+                    # Recovery days — find when curve climbs back to the
+                    # peak that PRECEDED the max DD. If the curve never
+                    # returns to that level, recovery_days stays None
+                    # and the gate logic flags it as still-underwater.
+                    recovery_days: float | None = None
+                    if trough_idx >= 0 and peak_idx_at_max_dd >= 0:
+                        target = peak_at_max_dd
+                        for j in range(trough_idx + 1, len(eq_series)):
+                            if eq_series[j][1] >= target:
+                                try:
+                                    from datetime import datetime
+                                    t1 = datetime.fromisoformat(
+                                        eq_series[trough_idx][0].replace("Z", "+00:00"))
+                                    t2 = datetime.fromisoformat(
+                                        eq_series[j][0].replace("Z", "+00:00"))
+                                    recovery_days = round(
+                                        (t2 - t1).total_seconds() / 86400, 1)
+                                except Exception:
+                                    recovery_days = None
+                                break
+
+                # P(pass 30d) — estimate from PF + sample size:
+                #   PF >= 2.0 → 0.95
+                #   PF >= 1.5 → 0.85
+                #   PF >= 1.2 → 0.75
+                #   PF >= 1.1 → 0.70
+                #   PF >= 1.0 → 0.55
+                #   else      → 0.30
+                # The Composer's default min_pass_rate is 0.70, so cells
+                # need PF >= 1.1 to qualify by default — matches our
+                # cost-priced "real edge" criterion exactly.
+                    # Compare PF against finite caps using a sentinel for
+                    # the infinity case so we don't accidentally pass a
+                    # gate that requires "PF >= 1.0" with `inf` (which
+                    # technically passes but indicates 0 losses, not real
+                    # edge). Use a finite display value of 99 only for
+                    # capping purposes; gate logic uses inf-aware tests.
+                    if pf == float("inf"):    p_pass = 0.95
+                    elif pf >= 2.0:           p_pass = 0.95
+                    elif pf >= 1.5:           p_pass = 0.85
+                    elif pf >= 1.2:           p_pass = 0.75
+                    elif pf >= 1.1:           p_pass = 0.70
+                    elif pf >= 1.0:           p_pass = 0.55
+                    else:                     p_pass = 0.30
+
+                    # Sustained: equity curve never went below -10%
+                    sustained = max_dd_pct < 10.0
+                    import math
+                    # PF cap for score input — a 17-trade no-loss run
+                    # used to score with PF=99 here, dominating real
+                    # cells. Now infinity falls to a sane 5.0 weight,
+                    # then the no-loss gate (n_losses < 3) kicks it out.
+                    pf_for_score = (5.0 if pf == float("inf")
+                                      else min(pf, 10.0))
+                    rr_capped = min(max(rr_ratio, 1.0), 4.0)
+                    sample_bonus = math.log10(max(n, 10)) * 5.0
+                    ftmo_bonus = (5.0 if (pf >= 1.1 or pf == float("inf"))
+                                    and sustained else 0.0)
+                    streak_penalty = max_streak * 0.5
+                    # `pct_per_month` measures live-relevance: P&L per
+                    # month over the FULL parquet span, NOT just the
+                    # span of trades produced. Pre-fix used (last_trade
+                    # − first_trade), so a strategy that stops generating
+                    # signals halfway through the parquet would get its
+                    # net_pnl divided by a SHORTER span — boosting score
+                    # for defunct strategies whose edge faded mid-data.
+                    # Now we read parquet timestamps directly.
+                    pct_per_month = 0.0
+                    try:
+                        parquet_path = (
+                            REPO_ROOT / "data" /
+                            f"{row['symbol']}_{row['tf']}.parquet"
+                        )
+                        if parquet_path.exists():
+                            import pandas as _pd
+                            _bars_meta = _pd.read_parquet(
+                                parquet_path, columns=["time"]
+                            )
+                            if len(_bars_meta) >= 2:
+                                t_first = _bars_meta["time"].iloc[0]
+                                t_last = _bars_meta["time"].iloc[-1]
+                                # tz-naive vs aware: convert to UTC seconds
+                                if hasattr(t_first, "tz_localize"):
+                                    if t_first.tz is None:
+                                        t_first = t_first.tz_localize("UTC")
+                                        t_last = t_last.tz_localize("UTC")
+                                span_s = (t_last - t_first).total_seconds()
+                                months = max(1.0, span_s / (86400 * 30.4))
+                                pct_per_month = (net / start_bal * 100) / months
+                    except Exception:
+                        # Fallback to old behavior if parquet read fails
+                        try:
+                            from datetime import datetime
+                            if len(eq_series) >= 2:
+                                t_first = datetime.fromisoformat(
+                                    eq_series[0][0].replace("Z", "+00:00"))
+                                t_last = datetime.fromisoformat(
+                                    eq_series[-1][0].replace("Z", "+00:00"))
+                                months = max(1.0,
+                                              (t_last - t_first).total_seconds()
+                                              / (86400 * 30.4))
+                                pct_per_month = (net / start_bal * 100) / months
+                        except Exception:
+                            pct_per_month = 0.0
+                    dd_penalty = max(0, max_dd_pct - 5.0) * 1.0
+                    if recovery_days is None:
+                        recov_penalty = 8.0
+                    elif recovery_days > 60:
+                        recov_penalty = (recovery_days - 60) * 0.05
+                    else:
+                        recov_penalty = 0.0
+                    score = (
+                        pct_per_month * 5.0
+                        + pf_for_score * 3.0
+                        + avg_r * 10.0
+                        + rr_capped * 2.0
+                        + sample_bonus
+                        + ftmo_bonus
+                        - streak_penalty
+                        - dd_penalty
+                        - recov_penalty
+                        + 10.0    # freshness — v2.db is the latest test
+                    )
+                    # Hard gates. For PF=inf (zero losses), pass a
+                    # large finite value so the gate passes nominally,
+                    # but ALSO require minimum losses so a cherry-picked
+                    # win streak can't qualify. n_losses_gate flags it.
+                    gates_failed = list(_evaluate_hard_gates(
+                        overall_pf=(99.0 if pf == float("inf") else pf),
+                        test_pf=(99.0 if test_pf == float("inf") else test_pf),
+                        test_r=test_r,
+                        recovery_days=recovery_days, n_test=test_n,
+                        strategy_name=variant,
+                    ))
+                    # Extra gate: require at least a few REAL losses in
+                    # the OOS partition so a 0-loss run doesn't sneak
+                    # past the PF gate trivially. PF=∞ with 0 losses is
+                    # mathematically infinite but statistically meaningless.
+                    n_test_losses = sum(1 for t in test_trades
+                                         if (t["realized_pnl"] or 0) < 0)
+                    if n_test_losses < 3:
+                        gates_failed.append(
+                            f"OOS partition has only {n_test_losses} "
+                            f"loss(es) (< 3) — PF/edge unreliable until "
+                            f"the strategy has experienced real adversity"
+                        )
+                    gates_failed = tuple(gates_failed)
+                    if gates_failed:
+                        score = min(score, 15.0)
+                    score = round(score, 2)
+                    # For storage / display, infinity is awkward —
+                    # convert to a clearly-flagged sentinel value of
+                    # 99.0 in the persisted EdgeStat (legacy callers
+                    # that don't expect inf still work). Hard gate
+                    # already explains WHY this cell is suspicious.
+                    train_pf_persist = (99.0 if train_pf == float("inf")
+                                          else train_pf)
+                    test_pf_persist = (99.0 if test_pf == float("inf")
+                                        else test_pf)
+                    out.append(EdgeStat(
+                        ticker=row["symbol"], tf=row["tf"], strategy=variant,
+                        n_train=train_n,
+                        train_pf=train_pf_persist, train_r=train_r,
+                        n_test=test_n,
+                        test_pf=test_pf_persist, test_r=test_r,
+                        rr_label=rr_label, side=side,
+                        win_rate_pct=round(wr, 2),
+                        net_pnl_dollars=round(net, 2),
+                        max_dd_pct=round(max_dd_pct, 2),
+                        max_dd_dollars=round(max_dd_dollars, 2),
+                        max_dd_days=0.0,
+                        recovery_days=recovery_days,
+                        max_consec_losses=max_streak,
+                        rr_ratio=round(rr_ratio, 2),
+                        avg_win_dollars=round(avg_w, 2),
+                        avg_loss_dollars=round(avg_l, 2),
+                        cagr_pct=None,
+                        p_pass_30d=round(p_pass, 2),
+                        sustained=sustained,
+                        score=score,
+                        hard_gate_failed=gates_failed,
+                        source_config_json=row["config_json"] or "",
+                    ))
+                except Exception as _row_err:
+                    # One bad row doesn't invalidate the whole catalog.
+                    # Log the row identifier so the user can see WHY
+                    # cells are missing without grovelling through SQL.
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        "edge_catalog: skipping v2.db run %s "
+                        "(symbol=%s tf=%s strat=%s) — %s: %s",
+                        row["run_id"], row.get("symbol"), row.get("tf"),
+                        row.get("strategy_name"),
+                        type(_row_err).__name__, _row_err,
+                    )
+                    continue
+    except sqlite3.DatabaseError as _db_err:
+        # Genuine DB-level failure (e.g. corrupt file, schema mismatch).
+        # Pre-fix this caught Exception and silently returned [], hiding
+        # ALL bugs. Now we explicitly handle SQLite errors and surface
+        # programming bugs (KeyError, AttributeError, etc.) up the stack.
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "edge_catalog: v2.db read failed — %s: %s",
+            type(_db_err).__name__, _db_err,
+        )
+        return []
+    return out
+
+
+def load_catalog(path: Path | None = None,
+                   *, db_path: Path | None = None
+                   ) -> dict[tuple[str, str], list[EdgeStat]]:
     """Return {(ticker, tf): [EdgeStat, ...]}. Empty dict if no data.
 
-    When `path` is None, loads BOTH the default grid_results.md AND
-    every `docs/optimization_*.md`. Optimizer entries take precedence
-    (de-duped by (ticker, tf, strategy) — first seen wins, with
-    optimizer files iterated newest-first).
+    Three sources are merged with this priority (newest wins):
+      1. `data/v2.db` runs table — auto-discovers any cell backtested
+         via `scripts/run_backtest.py` (HIGHEST priority, always fresh)
+      2. `docs/optimization_*.md` — newest file first (curated optimizer
+         output)
+      3. `docs/grid_results.md` — legacy fallback
+
+    De-duped by (ticker, tf, strategy) — first seen wins.
+
+    When `path` is provided it overrides the markdown sources (used by
+    tests). When `db_path` is None we use REPO_ROOT/data/v2.db.
     """
+    out: dict[tuple[str, str], list[EdgeStat]] = {}
+    seen: set[tuple[str, str, str]] = set()
+
+    # Source 1 — v2.db (highest priority because most recent backtest
+    # run wins, and run_backtest.py persists immediately)
+    if path is None:    # tests pass a specific path → skip db scan
+        if db_path is None:
+            db_path = DEFAULT_DB_PATH
+        for r in _load_from_v2db(db_path):
+            key = (r.ticker, r.tf, r.strategy)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.setdefault((r.ticker, r.tf), []).append(r)
+
+    # Source 2/3 — markdown files
     if path is not None:
         sources = [path]
     else:
-        # Scan the same dir as DEFAULT_GRID_PATH so test monkeypatching
-        # of that constant also redirects the optimization-file scan.
         docs = DEFAULT_GRID_PATH.parent
         sources = []
         if docs.exists():
-            # Newest optimization files first → they win the de-dupe
             sources.extend(sorted(docs.glob("optimization_*.md"),
                                     reverse=True))
         sources.append(DEFAULT_GRID_PATH)
-
-    out: dict[tuple[str, str], list[EdgeStat]] = {}
-    seen: set[tuple[str, str, str]] = set()
 
     for p in sources:
         if not p.exists():

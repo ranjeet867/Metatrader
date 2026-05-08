@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -63,6 +64,35 @@ class CloseResult:
     exit_price: float
     retcode: int
     error: str = ""
+    bridge_response: dict = field(default_factory=dict)
+    attempts: int = 1
+
+    @property
+    def detailed_error(self) -> str:
+        """Human-readable error including retcode + bridge response.
+
+        Returns "" when ok. Used by the UI to show WHY a close failed
+        instead of a bare 'failed' message.
+        """
+        if self.ok:
+            return ""
+        parts = []
+        if self.error:
+            parts.append(self.error)
+        if self.retcode and self.retcode != 0:
+            parts.append(f"retcode={self.retcode}")
+        # Include any bridge-level error keys not already in `error`
+        if isinstance(self.bridge_response, dict):
+            br_err = self.bridge_response.get("error")
+            if br_err and br_err not in (self.error, ""):
+                parts.append(f"bridge_error={br_err}")
+            # Also surface comment if it has anything useful
+            cmt = self.bridge_response.get("comment", "")
+            if cmt and cmt not in (self.error, ""):
+                parts.append(f"comment={cmt}")
+        if self.attempts > 1:
+            parts.append(f"after {self.attempts} attempts")
+        return " · ".join(parts) if parts else "unknown error"
 
 
 @dataclass(frozen=True)
@@ -178,16 +208,59 @@ class PositionManager:
             return CloseResult(ticket=ticket, ok=True, realized_pnl=0.0,
                                 exit_price=0.0, retcode=0,
                                 error="dry_run")
-        try:
-            res = self.bridge.position_close(ticket=ticket)
-        except (BridgeError, Exception) as e:
-            self.journal.record_bridge_event(
-                method="position_close", latency_ms=0, ok=False,
-                error=f"close({ticket}): {type(e).__name__}: {e}",
+        # Retry the bridge close — broker can return TRADE_RETCODE_REQUOTE,
+        # MARKET_CLOSED, or other transient codes on the first try. Each
+        # attempt is logged so the user can see the full error chain in
+        # bridge_events even if the final attempt eventually succeeds.
+        max_attempts = 3
+        last_exc = None
+        last_resp = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                res = self.bridge.position_close(ticket=ticket)
+                last_resp = getattr(res, "_raw_response", None) or {
+                    "ok": res.ok, "retcode": res.retcode,
+                    "deal": res.deal, "price": res.price,
+                    "comment": res.comment,
+                }
+                if res.ok:
+                    break
+                # Bridge returned but ok=False — log + retry
+                self.journal.record_bridge_event(
+                    method="position_close", latency_ms=0, ok=False,
+                    error=(
+                        f"close({ticket}) attempt {attempt}/{max_attempts}: "
+                        f"retcode={res.retcode} comment={res.comment!r}"
+                    ),
+                )
+                last_exc = (
+                    f"retcode={res.retcode} "
+                    f"comment={res.comment!r}"
+                    if res.comment
+                    else f"retcode={res.retcode}"
+                )
+            except Exception as e:
+                self.journal.record_bridge_event(
+                    method="position_close", latency_ms=0, ok=False,
+                    error=(
+                        f"close({ticket}) attempt {attempt}/{max_attempts}: "
+                        f"{type(e).__name__}: {e}"
+                    ),
+                )
+                last_exc = f"{type(e).__name__}: {e}"
+                last_resp = {"error": str(e)}
+            # Backoff between attempts
+            if attempt < max_attempts:
+                time.sleep(0.3 * attempt)
+        else:
+            # Exhausted retries without success
+            return CloseResult(
+                ticket=ticket, ok=False, realized_pnl=0.0,
+                exit_price=0.0, retcode=-1,
+                error=str(last_exc or "close failed (no detail)"),
+                bridge_response=last_resp or {},
+                attempts=max_attempts,
             )
-            return CloseResult(ticket=ticket, ok=False, realized_pnl=0.0,
-                                exit_price=0.0, retcode=-1,
-                                error=str(e))
         # Realized PnL is reported by the deal — we read history to confirm
         realized = self._fetch_close_pnl(ticket)
         # Drop from open_positions
@@ -197,9 +270,13 @@ class PositionManager:
         self._record_close_event(ticket=ticket, reason=reason,
                                   exit_price=res.price,
                                   realized_pnl=realized)
-        return CloseResult(ticket=ticket, ok=res.ok, realized_pnl=realized,
-                            exit_price=res.price, retcode=res.retcode,
-                            error="" if res.ok else res.comment)
+        return CloseResult(
+            ticket=ticket, ok=True, realized_pnl=realized,
+            exit_price=res.price, retcode=res.retcode,
+            error="",
+            bridge_response=last_resp or {},
+            attempts=attempt,
+        )
 
     def close_all(self, *, reason: str, dry_run: bool = False
                    ) -> list[CloseResult]:

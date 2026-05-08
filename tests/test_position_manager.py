@@ -164,6 +164,40 @@ class TestClose:
         assert not by_ticket[2].ok
         assert by_ticket[3].ok
 
+    def test_close_one_failure_carries_detailed_error(self):
+        """When the bridge raises, CloseResult.detailed_error includes
+        the exception text — NOT just an empty string. This is what
+        the UI shows so the user can see why the close failed."""
+        bridge = _bridge_with([_bp(1)], deals=[], fail_on={1})
+        pm = PositionManager(account_login=1, bridge=bridge,
+                              db_path=_tmp_db())
+        res = pm.close_one(1, reason="manual_close_ui")
+        assert not res.ok
+        # The detailed_error MUST be non-empty (this was the bug — UI
+        # showed bare "Close failed:" with no info).
+        assert res.detailed_error, (
+            "detailed_error is empty — UI would show 'Close failed:' "
+            "with no actionable info"
+        )
+        # Should include some form of the failure reason
+        assert (res.error or "" in res.detailed_error) is not None
+        # And the bridge_response dict is populated for the debug expander
+        assert isinstance(res.bridge_response, dict)
+
+
+    def test_close_one_retries_attempts_recorded(self):
+        """The CloseResult.attempts field reflects how many tries the
+        retry loop made before giving up."""
+        # All attempts fail — attempts should equal max (3)
+        bridge = _bridge_with([_bp(1)], deals=[], fail_on={1})
+        pm = PositionManager(account_login=1, bridge=bridge,
+                              db_path=_tmp_db())
+        res = pm.close_one(1, reason="manual_close_ui")
+        assert not res.ok
+        assert res.attempts == 3, (
+            f"expected 3 attempts, got {res.attempts}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # reconcile_with_broker

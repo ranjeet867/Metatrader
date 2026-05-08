@@ -115,6 +115,24 @@ DEFAULT_MONEY_PER_UNIT: dict[str, float] = {
     "USDJPY":     700.0,
     "GBPJPY":     700.0,
 }
+
+
+def resolve_money_per_unit(ticker: str) -> float:
+    """Same as dashboards.components.state.resolve_money_per_unit but
+    using THIS file's local DEFAULT_MONEY_PER_UNIT. Falls back to
+    data/symbol_info.json (broker tick math) when ticker not in the
+    hand-curated dict — fixes the silent $1/$ underpricing for XAUUSD
+    /XAGUSD/XPDUSD/stocks etc. that made cost-priced backtests fake-bad."""
+    if ticker in DEFAULT_MONEY_PER_UNIT:
+        return DEFAULT_MONEY_PER_UNIT[ticker]
+    try:
+        from core.symbol_info_loader import try_load
+        si = try_load(ticker)
+        if si is not None and si.tick_size > 0 and si.tick_value > 0:
+            return si.tick_value / si.tick_size
+    except Exception:
+        pass
+    return 1.0
 DEFAULT_LOTS: dict[str, float] = {
     "US100.cash": 6.5,
     "US500.cash": 20.0,
@@ -208,7 +226,7 @@ def render_freshness_bar(data_index: dict[str, dict[str, Path]]) -> None:
         emoji_map = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
         df["age"] = df["bucket"].map(emoji_map) + " " + df["age_days"].astype(str) + "d"
         st.dataframe(df[["ticker", "tf", "modified_utc", "age"]],
-                      use_container_width=True,
+                      width="stretch",
                       height=min(360, 36 * (len(rows) + 1)))
 
 
@@ -448,7 +466,7 @@ def render_backtest_tab(strategies, data_index) -> None:
         balance = float(st.number_input("starting balance ($)", value=91_400.0,
                                          step=1000.0, key="bt_bal"))
         default_lots = DEFAULT_LOTS.get(ticker, 0.1)
-        default_mpu = DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0)
+        default_mpu = resolve_money_per_unit(ticker)
         lots = float(st.number_input("lots", value=default_lots,
                                       step=0.1, format="%.2f", key="bt_lots"))
         mpu = float(st.number_input("money per 1.0 unit per lot ($)",
@@ -463,7 +481,7 @@ def render_backtest_tab(strategies, data_index) -> None:
                                        value=0.6, step=0.05, key="bt_train"))
 
         run_btn = st.button("▶  Run Backtest", type="primary",
-                             use_container_width=True, key="bt_run")
+                             width="stretch", key="bt_run")
 
     # ---- Main area ----
     st.subheader(f"Backtest — {ticker} {tf} • {strat_name}")
@@ -551,9 +569,9 @@ def render_backtest_tab(strategies, data_index) -> None:
     title = f"{meta['ticker']} {meta['tf']} • {meta['strat']} — equity"
     st.plotly_chart(equity_figure(r.equity_curve, split_time,
                                     meta["balance"], title),
-                     use_container_width=True)
+                     width="stretch")
     st.plotly_chart(drawdown_figure(r.equity_curve),
-                     use_container_width=True)
+                     width="stretch")
 
     # ---- Trade tape + reasons ----
     if n > 0:
@@ -561,10 +579,10 @@ def render_backtest_tab(strategies, data_index) -> None:
         with c1:
             st.markdown("**Trade tape** (sortable)")
             st.dataframe(trades_to_dataframe(r.trades, df),
-                          use_container_width=True, height=360)
+                          width="stretch", height=360)
         with c2:
             st.plotly_chart(trade_reasons_figure(r.trades),
-                             use_container_width=True)
+                             width="stretch")
     else:
         st.info("No trades produced — try different params or a longer history.")
 
@@ -594,7 +612,7 @@ def render_refresh_tab(data_index) -> None:
                     ).isoformat(timespec="seconds"),
                 })
         if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+            st.dataframe(pd.DataFrame(rows), width="stretch",
                           height=min(360, 36 * (len(rows) + 1)))
         else:
             st.caption("(no parquets yet)")
@@ -674,7 +692,7 @@ def render_sweep_tab(strategies, data_index) -> None:
     prog = st.progress(0.0, text="Running sweep...")
     done = 0
     for ticker in tickers:
-        mpu = DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0)
+        mpu = resolve_money_per_unit(ticker)
         lots = DEFAULT_LOTS.get(ticker, 0.1)
         for tf in tfs:
             if tf not in data_index.get(ticker, {}):
@@ -733,7 +751,7 @@ def render_sweep_tab(strategies, data_index) -> None:
     df_grid["train_PF"] = df_grid["train_PF"].replace(float("inf"), 9.99)
     df_grid_sorted = df_grid.sort_values("test_R", ascending=False)
     st.markdown(f"**{len(df_grid)} cells**  —  sorted by test_R desc")
-    st.dataframe(df_grid_sorted, use_container_width=True, height=380)
+    st.dataframe(df_grid_sorted, width="stretch", height=380)
 
     # ---- Heatmap (ticker × strategy, color = test_R) ----
     if len(df_grid) >= 2:
@@ -755,7 +773,7 @@ def render_sweep_tab(strategies, data_index) -> None:
         ))
         fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10),
                             title="test_R heatmap (out-of-sample R per trade)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ---- Survivors filter ----
     survivors = df_grid_sorted[
@@ -767,7 +785,7 @@ def render_sweep_tab(strategies, data_index) -> None:
     ]
     st.markdown(f"### ⭐ Survivors  ({len(survivors)})")
     if len(survivors):
-        st.dataframe(survivors, use_container_width=True,
+        st.dataframe(survivors, width="stretch",
                       height=min(360, 36 * (len(survivors) + 1)))
     else:
         st.info("No cells met the acceptance criteria.")

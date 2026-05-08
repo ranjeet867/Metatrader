@@ -107,6 +107,129 @@ def trades_to_dataframe(trades, candles: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def win_loss_donut(trades) -> go.Figure:
+    """AlgoTest-style donut: wins vs losses vs break-even. With centre
+    label showing win rate %."""
+    if not trades:
+        return go.Figure().update_layout(height=240, title="(no trades)")
+    n = len(trades)
+    wins = sum(1 for t in trades if t.realized_pnl > 0)
+    losses = sum(1 for t in trades if t.realized_pnl < 0)
+    even = n - wins - losses
+    win_pct = wins / n * 100.0 if n else 0.0
+    fig = go.Figure(data=[go.Pie(
+        labels=["Wins", "Losses", "Break-even"],
+        values=[wins, losses, even],
+        hole=0.62,
+        marker=dict(colors=["#16a34a", "#dc2626", "#6b7280"]),
+        textinfo="label+percent", textposition="outside",
+        sort=False,
+    )])
+    fig.update_layout(
+        height=300, margin=dict(l=10, r=10, t=40, b=10),
+        title=f"Win / Loss split — {n} trades",
+        showlegend=False, plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        annotations=[dict(
+            text=f"<b>{win_pct:.1f}%</b><br><span style='font-size:11px'>"
+                 f"win rate</span>",
+            x=0.5, y=0.5, font_size=22, showarrow=False,
+            font_color="#cbd5e1",
+        )]
+    )
+    return fig
+
+
+def streak_figure(trades) -> go.Figure:
+    """Bar chart of consecutive win/loss streaks in chronological order.
+
+    Each bar is one streak — height = streak length, colour = win/loss.
+    Hovering shows the date range. AlgoTest's "streak chart".
+    """
+    if not trades:
+        return go.Figure().update_layout(height=240, title="(no trades)")
+    streaks: list[tuple[str, int, int]] = []  # (kind, length, end_idx)
+    cur_kind = None
+    cur_len = 0
+    for i, t in enumerate(trades):
+        kind = "win" if t.realized_pnl > 0 else (
+            "loss" if t.realized_pnl < 0 else "even")
+        if kind == cur_kind:
+            cur_len += 1
+        else:
+            if cur_kind is not None:
+                streaks.append((cur_kind, cur_len, i - 1))
+            cur_kind, cur_len = kind, 1
+    if cur_kind is not None:
+        streaks.append((cur_kind, cur_len, len(trades) - 1))
+    if not streaks:
+        return go.Figure().update_layout(height=240, title="(no streaks)")
+    xs = list(range(len(streaks)))
+    ys = [s[1] if s[0] == "win" else -s[1] for s in streaks]
+    colors = [("#16a34a" if s[0] == "win"
+                else "#dc2626" if s[0] == "loss"
+                else "#6b7280") for s in streaks]
+    text = [f"{s[0]}: {s[1]}" for s in streaks]
+    fig = go.Figure(go.Bar(
+        x=xs, y=ys, marker_color=colors,
+        text=text, hovertemplate="%{text}<extra></extra>",
+    ))
+    max_win = max((s[1] for s in streaks if s[0] == "win"), default=0)
+    max_loss = max((s[1] for s in streaks if s[0] == "loss"), default=0)
+    fig.update_layout(
+        height=260, margin=dict(l=10, r=10, t=40, b=10),
+        title=f"Win/Loss streaks — longest win {max_win}, "
+              f"longest loss {max_loss}",
+        xaxis_title="streak # (chronological)",
+        yaxis_title="streak length (+ wins / − losses)",
+        plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        xaxis=dict(gridcolor="#1f2937", showticklabels=False),
+        yaxis=dict(gridcolor="#1f2937", zeroline=True,
+                    zerolinecolor="#4b5563"),
+        showlegend=False,
+    )
+    return fig
+
+
+def cumulative_pnl_figure(trades) -> go.Figure:
+    """Per-trade cumulative P&L curve. Each step = one trade. Shows
+    AlgoTest-style 'growth' independent of bar timestamps."""
+    if not trades:
+        return go.Figure().update_layout(height=240, title="(no trades)")
+    cum = 0.0
+    xs, ys = [0], [0.0]
+    peak = 0.0
+    for i, t in enumerate(trades, 1):
+        cum += t.realized_pnl
+        peak = max(peak, cum)
+        xs.append(i)
+        ys.append(cum)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="lines",
+        name="cumulative P&L",
+        line=dict(color="#38bdf8", width=2),
+        fill="tozeroy", fillcolor="rgba(56,189,248,0.10)",
+    ))
+    fig.add_hline(y=peak, line=dict(color="#16a34a", dash="dash"),
+                   annotation_text=f"peak ${peak:+,.0f}",
+                   annotation_position="top right",
+                   annotation_font=dict(color="#16a34a", size=10))
+    fig.update_layout(
+        height=260, margin=dict(l=10, r=10, t=40, b=10),
+        title="Cumulative P&L by trade",
+        xaxis_title="trade #", yaxis_title="cumulative $",
+        plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        xaxis=dict(gridcolor="#1f2937"),
+        yaxis=dict(gridcolor="#1f2937", zeroline=True,
+                    zerolinecolor="#4b5563"),
+        hovermode="x unified",
+    )
+    return fig
+
+
 def heatmap_test_R(df_grid: pd.DataFrame) -> go.Figure:
     """Heatmap of (ticker × strategy) coloured by mean test_R."""
     if df_grid["tf"].nunique() > 1:

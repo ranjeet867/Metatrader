@@ -105,18 +105,22 @@ def render(*, login: int, container=None) -> None:
                        if n_today else "—")
 
         row = target.columns([3, 1, 1, 1, 1, 1, 1, 1])
-        with row[0].container(border=True):
-            mode_color = {"paper": "#b08800", "live": "#0c8a3a"}.get(
-                d.status, "#475569")
-            mode_dot = ("🟡" if d.status == "paper"
-                         else "🟢" if d.status == "live" else "⚪")
-            row[0].markdown(
-                f"<div style='font-family:ui-monospace,Menlo,monospace;"
-                f"font-size:0.86rem;line-height:1.4;'>"
-                f"<b>{mode_dot} {d.strategy}</b><br>"
-                f"<span style='color:#9ca3af;'>{d.ticker} · {d.tf} · "
-                f"{'long' if d.long_only else 'bidir'}</span></div>",
-                unsafe_allow_html=True)
+        # NOTE: previously we used `with row[0].container(border=True):`
+        # but then wrote to `row[0].markdown(...)` (NOT to the inner
+        # container), which produced an empty bordered box plus the
+        # content rendered separately next to it. Removing the
+        # container — the column itself is the layout slot.
+        mode_color = {"paper": "#b08800", "live": "#0c8a3a"}.get(
+            d.status, "#475569")
+        mode_dot = ("🟡" if d.status == "paper"
+                     else "🟢" if d.status == "live" else "⚪")
+        row[0].markdown(
+            f"<div style='font-family:ui-monospace,Menlo,monospace;"
+            f"font-size:0.86rem;line-height:1.4;'>"
+            f"<b>{mode_dot} {d.strategy}</b><br>"
+            f"<span style='color:#9ca3af;'>{d.ticker} · {d.tf} · "
+            f"{'long' if d.long_only else 'bidir'}</span></div>",
+            unsafe_allow_html=True)
         row[1].markdown(
             f"<span style='background:{mode_color};color:white;"
             f"padding:2px 8px;border-radius:10px;font-size:0.7rem;"
@@ -145,7 +149,7 @@ def render(*, login: int, container=None) -> None:
             f"font-size:0.78rem;color:#9ca3af;'>{last_close}</span>",
             unsafe_allow_html=True)
         if row[7].button("⏹ Stop", key=f"stop_run_{d.deployment_id}",
-                          use_container_width=True):
+                          width="stretch"):
             dep_mod.update_status(login, d.deployment_id, "idle")
             st.toast(f"Stopped {d.deployment_id}")
             st.rerun()

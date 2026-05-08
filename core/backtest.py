@@ -105,8 +105,15 @@ def summarize_trades(trades: list[ClosedTrade], label: str,
                                 win_rate=0.0, profit_factor=0.0, avg_R=0.0,
                                 bar_range=bar_range)
     n = len(trades)
+    # CANONICAL convention — pre-fix `losses` used `<= 0` which lumped
+    # break-even trades (realized_pnl == 0) into the loss bucket. The
+    # edge_catalog v2.db loader uses `< 0`. Two paths disagreed by one
+    # trade on any backtest where commission exactly zeroed a winner.
+    # Now: win = > 0, loss = < 0, scratch = == 0 (counted in n_trades
+    # but excluded from PF math). win_rate is computed as wins/n so
+    # break-evens slightly drag down the win rate — accurate.
     wins = [t for t in trades if t.realized_pnl > 0]
-    losses = [t for t in trades if t.realized_pnl <= 0]
+    losses = [t for t in trades if t.realized_pnl < 0]
     gw = sum(t.realized_pnl for t in wins)
     gl = -sum(t.realized_pnl for t in losses)
     pf = (gw / gl) if gl > 0 else (float("inf") if gw > 0 else 0.0)
@@ -273,6 +280,10 @@ def run_backtest(
         flat_buffer_minutes=flat_buffer_minutes,
         no_entry_minutes_before_close=no_entry_minutes_before_close,
         asset_class_overrides=asset_class_overrides,
+        # Mirror run_backtest's enforce_daily_flat into the cfg so any
+        # downstream consumer (replay, paper_executor) gates on the
+        # same flag — guaranteeing parity between the two engines.
+        enforce_daily_flat=enforce_daily_flat,
     )
 
     def _bar_close_utc(i: int) -> datetime:

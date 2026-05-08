@@ -58,19 +58,30 @@ def main():
 
     client = MT5AccountClient()
     updated = 0
+    skipped_bad = 0
     for sym in symbols:
         try:
             si = client.symbol_info(sym, force_refresh=True)
         except Exception as e:
             print(f"  [skip] {sym}: bridge error: {e}")
             continue
+        # Reach into the raw bridge payload so we capture digits / volume_max
+        # even though SymbolInfo dataclass doesn't carry them.
+        raw = client._call("symbol_info", {"name": sym}).get("data", {})
+        digits = int(raw.get("digits", 2))
+        volume_max = float(raw.get("volume_max", 100.0))
+        if si.tick_value <= 0.0:
+            print(f"  [WARN] {sym}: bridge returned tick_value=0 — "
+                  f"position-sizing will fail. Recompile the EA from "
+                  f"mql5/MT5BridgeFile.mq5 and reattach.")
+            skipped_bad += 1
         existing["symbols"][sym] = {
             "tick_size": si.tick_size,
             "tick_value": si.tick_value,
             "volume_step": si.volume_step,
             "volume_min": si.volume_min,
-            "volume_max": getattr(si, "volume_max", 100.0),
-            "digits": getattr(si, "digits", 2),
+            "volume_max": volume_max,
+            "digits": digits,
             "contract_size": si.contract_size,
         }
         print(f"  [ok]   {sym}: tick_size={si.tick_size}  "
@@ -82,6 +93,11 @@ def main():
                                   encoding="utf-8")
     print(f"\nWrote {SYMBOL_INFO_PATH.relative_to(REPO)} "
           f"({updated} symbols updated)")
+    if skipped_bad:
+        print(f"\n⚠️  {skipped_bad} symbol(s) had tick_value=0. Live deployments "
+              f"WILL refuse to size them in strict mode.")
+        print("   Cause: the EA is emitting a stale schema. Recompile "
+              "mql5/MT5BridgeFile.mq5 in MetaEditor and re-attach.")
 
 
 if __name__ == "__main__":

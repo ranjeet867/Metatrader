@@ -43,6 +43,22 @@ class TickResult:
     closes: list[ClosedTrade] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     skipped_due_to_no_entry_window: int = 0
+    skipped_due_to_circuit_breaker: int = 0
+    skipped_due_to_position_guard: int = 0
+    # When the strategy DETECTED a signal on the last bar, regardless of
+    # whether the open succeeded (could have been blocked by guard /
+    # parity / sizing / circuit breaker / already-holding). Bar timestamp
+    # of the closed bar where the signal printed, ISO-8601 UTC. None
+    # means "no signal on this tick". Surfacing this lets the dashboard
+    # show `last_signal_at_utc` correctly even when an open is blocked.
+    last_signal_bar_utc: Optional[str] = None
+    # Always set when this tick processed a closed bar (i.e. strategy
+    # was called with a NEW bar, not deduped to "no_new_bar"). Lets the
+    # dashboard prove "the runner is alive on this deployment" without
+    # waiting for a signal — a stale `last_evaluated_at_utc` is a real
+    # red flag, a stale `last_signal_at_utc` may just mean low signal
+    # frequency.
+    last_evaluated_bar_utc: Optional[str] = None
 
 
 def _tf_seconds_from_view(view: pd.DataFrame) -> int:
@@ -95,6 +111,13 @@ def tick(view: pd.DataFrame,
          risk_pct: float | None = None,
          symbol_info=None,
          account_balance: float | None = None,
+         max_lots: float | None = None,
+         max_money_risk_usd: float | None = None,
+         # ----- Phase 30: production-grade safety hooks -----
+         block_opens_reason: str | None = None,
+         deployment_id: str = "",
+         open_positions_snapshot=None,   # list[OpenPosition] or None
+         position_guard_policy: str = "strict",
          ) -> TickResult:
     """One atomic processing step over `view` (a 1+-bar window of candles).
 
@@ -122,6 +145,19 @@ def tick(view: pd.DataFrame,
         return out
 
     last_idx = n - 1
+    # Record the last-bar timestamp early so we always surface
+    # `last_evaluated_bar_utc` even if a no-entry-window check returns
+    # before signals are computed.
+    try:
+        out.last_evaluated_bar_utc = pd.Timestamp(
+            view["time"].iloc[last_idx]
+        ).tz_convert("UTC").isoformat() if pd.Timestamp(
+            view["time"].iloc[last_idx]
+        ).tz is not None else pd.Timestamp(
+            view["time"].iloc[last_idx]
+        ).tz_localize("UTC").isoformat()
+    except Exception:
+        pass
 
     # --- 1. update_bar on existing position ---
     last_row = view.iloc[last_idx]
@@ -155,6 +191,18 @@ def tick(view: pd.DataFrame,
         out.skipped_due_to_no_entry_window += 1
         return out
 
+    # --- 2b. Circuit breaker — host pre-evaluated, refuse opens entirely ---
+    # The Operations / live runner calls circuit_breaker.evaluate() and
+    # passes a non-None reason here when state != OK. We still call
+    # update_bar above (existing positions can ride to SL/TP) but skip
+    # any new opens.
+    if block_opens_reason:
+        out.skipped_due_to_circuit_breaker += 1
+        out.errors.append(
+            f"circuit_breaker BLOCK: {block_opens_reason}"
+        )
+        return out
+
     # --- 3 + 4. compute signals, filter to last bar ---
     try:
         sigs = strategy.signals(view)
@@ -165,6 +213,12 @@ def tick(view: pd.DataFrame,
     new_sigs = [s for s in sigs if s.bar_idx == last_idx]
     if not new_sigs:
         return out
+
+    # Signal DETECTED — record the bar timestamp regardless of whether
+    # the open succeeds below. Position-guard, sizing-rejection, and
+    # idempotency-collision all leave `opens` empty but the strategy
+    # genuinely fired — the dashboard should reflect that.
+    out.last_signal_bar_utc = out.last_evaluated_bar_utc
 
     # --- 5. open via idempotency-keyed call ---
     sizing_active = (risk_pct is not None and risk_pct > 0
@@ -178,6 +232,8 @@ def tick(view: pd.DataFrame,
                 equity=float(account_balance), risk_pct=float(risk_pct),
                 entry_price=sig.entry_price, stop_price=sig.stop_price,
                 sym=symbol_info,
+                max_lots=max_lots,
+                max_money_risk_usd=max_money_risk_usd,
             )
             if not res.ok:
                 out.errors.append(f"sizing rejected: {res.reason}")
@@ -185,6 +241,26 @@ def tick(view: pd.DataFrame,
             trade_lots = res.lots
         else:
             trade_lots = float(lots)
+
+        # Position-collision guard — reject opens that conflict with
+        # another deployment's existing position on the same symbol.
+        # Caller passes the cross-deployment positions snapshot in
+        # `open_positions_snapshot`; absent → guard not enforced.
+        if open_positions_snapshot is not None and deployment_id:
+            from core.position_guard import check_open as _guard_check
+            decision = _guard_check(
+                new_symbol=symbol,
+                new_side=sig.direction,
+                new_deployment_id=deployment_id,
+                open_positions=open_positions_snapshot,
+                policy=position_guard_policy,
+            )
+            if decision.decision in ("BLOCK", "STACK"):
+                out.skipped_due_to_position_guard += 1
+                out.errors.append(
+                    f"position_guard {decision.decision}: {decision.reason}"
+                )
+                continue
 
         key = make_idempotency_key(
             strategy.name, symbol, tf, view["time"].iloc[last_idx]

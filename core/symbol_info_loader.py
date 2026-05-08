@@ -55,12 +55,26 @@ def load_all(path: str | Path = DEFAULT_PATH) -> dict[str, SymbolInfo]:
         data = json.loads(body)
     except json.JSONDecodeError as e:
         raise ValueError(f"{p} is not valid JSON: {e}") from e
-    syms = data.get("symbols", {})
+    # Accept two formats:
+    #   1. Wrapped: {"_meta": {...}, "symbols": {SYM: info, ...}}
+    #   2. Flat:    {SYM: info, SYM2: info2, ...}  (legacy export)
+    if isinstance(data, dict) and "symbols" in data and isinstance(
+        data["symbols"], dict
+    ):
+        syms = data["symbols"]
+    else:
+        # Treat top-level dict as the symbol map directly. Drop the
+        # `_meta` sentinel and any non-dict values (those are exports
+        # from old-style flat dumps that mixed metadata with symbols).
+        syms = {k: v for k, v in data.items()
+                if isinstance(v, dict) and not k.startswith("_")}
     if not isinstance(syms, dict):
         raise ValueError(f"{p}: 'symbols' must be an object")
     out: dict[str, SymbolInfo] = {}
     for name, d in syms.items():
-        if name.startswith("_"):
+        # Skip the _meta sentinel; everything else MUST validate (we
+        # never silently default per INVARIANT-5).
+        if name.startswith("_") or name == "symbols":
             continue
         _validate_one(name, d)
         out[name] = SymbolInfo(
@@ -87,8 +101,42 @@ def load(name: str, path: str | Path = DEFAULT_PATH) -> SymbolInfo:
 
 def try_load(name: str, path: str | Path = DEFAULT_PATH) -> Optional[SymbolInfo]:
     """Same as load() but returns None instead of raising. For UI paths
-    that want to gracefully degrade."""
-    try:
-        return load(name, path)
-    except (FileNotFoundError, KeyError, ValueError):
+    that want to gracefully degrade.
+
+    Crucially, this only validates the *requested* symbol — it does NOT
+    fail just because some other symbol in the file is malformed (which
+    is a property of `load_all`). That made `_symbol_info_coverage`
+    report 0/N covered whenever ANY one symbol had bad data.
+    """
+    p = Path(path)
+    if not p.exists():
         return None
+    try:
+        body = p.read_text(encoding="utf-8")
+        data = json.loads(body)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and "symbols" in data and isinstance(
+        data["symbols"], dict
+    ):
+        syms = data["symbols"]
+    else:
+        syms = {k: v for k, v in data.items()
+                if isinstance(v, dict) and not k.startswith("_")}
+    d = syms.get(name)
+    if not isinstance(d, dict):
+        return None
+    try:
+        _validate_one(name, d)
+    except ValueError:
+        return None
+    return SymbolInfo(
+        name=name,
+        tick_size=float(d["tick_size"]),
+        tick_value=float(d["tick_value"]),
+        volume_step=float(d["volume_step"]),
+        volume_min=float(d["volume_min"]),
+        volume_max=float(d["volume_max"]),
+        digits=int(d["digits"]),
+        contract_size=float(d["contract_size"]),
+    )

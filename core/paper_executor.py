@@ -237,13 +237,18 @@ class PaperExecutor:
         if hit_target:
             return self._close_at_level(symbol, pos.target_price, "target", bar)
 
-        # 2. Forced-flat
+        # 2. Forced-flat. Both daily and weekend flats are now gated by
+        # explicit flags on the cfg, mirroring run_backtest's API. Pre-
+        # fix daily-flat fired whenever `daily_close_flat_classes` was
+        # non-empty — diverging from backtest when callers set weekend
+        # flat WITHOUT intending daily flat. Now they're independent.
         if self.time_guard_cfg is not None and bar_close_utc is not None:
             if (self.time_guard_cfg.weekend_flat_all
                 and needs_weekend_flat(bar_close_utc, self.time_guard_cfg)):
                 return self._close_at_level(symbol, bar.close,
                                               "weekend_flat", bar)
-            if needs_daily_flat(symbol, bar_close_utc, self.time_guard_cfg):
+            if (getattr(self.time_guard_cfg, "enforce_daily_flat", True)
+                and needs_daily_flat(symbol, bar_close_utc, self.time_guard_cfg)):
                 return self._close_at_level(symbol, bar.close,
                                               "daily_close_flat", bar)
 

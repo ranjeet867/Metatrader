@@ -106,6 +106,21 @@ class CloseOrderResult:
     comment: str
 
 
+@dataclass
+class OrderSendResult:
+    """Result of a market order send. retcode == 10009 on the bridge
+    means TRADE_RETCODE_DONE (success). Anything else is a broker-side
+    rejection; check `comment` and `error` for the human reason."""
+    ok: bool
+    ticket: int
+    retcode: int
+    deal: int
+    fill_price: float
+    volume: float
+    comment: str
+    error: str = ""
+
+
 class BridgeError(RuntimeError):
     """Raised when the bridge returns a malformed or error response.
 
@@ -205,13 +220,28 @@ class MT5AccountClient:
                 f"{resp.get('error', resp) if isinstance(resp, dict) else resp}"
             )
         data = resp.get("data", resp)
+        # Two EA generations are in the wild:
+        #   • V2Bridge.mq5         emits "tick_value" / "tick_size" / "contract_size"
+        #   • MT5BridgeFile.mq5    emits "trade_tick_value" / "trade_tick_size" /
+        #                                 "trade_contract_size"
+        # Accept both so the python client does not silently end up with 0.0.
+        def _pick(*keys, default):
+            for k in keys:
+                v = data.get(k)
+                if v is not None:
+                    return v
+            return default
+
+        tick_size = _pick("tick_size", "trade_tick_size", "point", default=0.0)
+        tick_value = _pick("tick_value", "trade_tick_value", default=0.0)
+        contract_size = _pick("contract_size", "trade_contract_size", default=1.0)
         si = SymbolInfo(
             name=name,
-            tick_size=float(data.get("tick_size", data.get("point", 0.0))),
-            tick_value=float(data.get("tick_value", 0.0)),
+            tick_size=float(tick_size),
+            tick_value=float(tick_value),
             volume_step=float(data.get("volume_step", 0.01)),
             volume_min=float(data.get("volume_min", 0.01)),
-            contract_size=float(data.get("contract_size", 1.0)),
+            contract_size=float(contract_size),
         )
         self._symbol_cache[name] = (now, si)
         return si
@@ -255,6 +285,55 @@ class MT5AccountClient:
                     f"positions_get: malformed row (missing/invalid {e!r}): {r}"
                 )
         return out
+
+    def order_send(self, *, symbol: str, direction: str, lots: float,
+                    sl: float = 0.0, tp: float = 0.0,
+                    deviation: int = 20, comment: str = "",
+                    magic: int = 770070) -> OrderSendResult:
+        """Send a market order to the broker. Returns OrderSendResult.
+
+        `direction` MUST be "LONG" or "SHORT" — the EA flips it to BUY/SELL.
+        SL and TP are stored on the broker (server-side) so they survive
+        a Python crash or laptop loss. SL/TP=0.0 means none (not advised
+        for live trading).
+
+        Raises BridgeError on connection / shape problems. A broker-side
+        rejection (e.g. market closed, bad volume) returns ok=False with
+        retcode + error populated — does NOT raise.
+        """
+        if direction.upper() not in ("LONG", "SHORT"):
+            raise ValueError(f"direction must be LONG or SHORT, got {direction!r}")
+        if lots <= 0:
+            raise ValueError(f"lots must be > 0, got {lots}")
+        params = {
+            "symbol": symbol,
+            "direction": direction.upper(),
+            "lots": float(lots),
+            "sl": float(sl),
+            "tp": float(tp),
+            "deviation": int(deviation),
+            "comment": comment,
+            "magic": int(magic),
+        }
+        resp = self._call("order_send", params)
+        if not isinstance(resp, dict):
+            raise BridgeError(f"order_send: expected dict; got {type(resp)}")
+        d = resp.get("data", resp)
+        # Bridge wraps as {ok: bool, ...} — accept either flat or nested
+        ok = bool(d.get("ok", resp.get("ok", False)))
+        err = str(resp.get("error", d.get("error", "")) or "")
+        if not ok and not err:
+            err = f"retcode={d.get('retcode', 'unknown')}"
+        return OrderSendResult(
+            ok=ok,
+            ticket=int(d.get("ticket", 0) or 0),
+            retcode=int(d.get("retcode", 0) or 0),
+            deal=int(d.get("deal", 0) or 0),
+            fill_price=float(d.get("fill_price", d.get("price", 0.0)) or 0.0),
+            volume=float(d.get("volume", 0.0) or 0.0),
+            comment=str(d.get("comment", "")),
+            error=err,
+        )
 
     def position_close(self, ticket: int, deviation: int = 20
                         ) -> CloseOrderResult:

@@ -105,13 +105,20 @@ def fmt_pf(pf: float) -> str:
 
 
 def main() -> int:
+    # All cost defaults sourced from core.cost_defaults — single source
+    # of truth shared with Backtest page + run_backtest CLI + rebaseline.
+    from core import cost_defaults as _cd
     ap = argparse.ArgumentParser()
-    ap.add_argument("--balance", type=float, default=91_400)
+    ap.add_argument("--balance", type=float,
+                    default=_cd.DEFAULT_STARTING_BALANCE_USD)
     ap.add_argument("--lots", type=float, default=0.0,
                     help="override per-ticker default lots (0 = use TICKER_CONFIG)")
-    ap.add_argument("--commission-per-trade", type=float, default=3.0)
-    ap.add_argument("--slippage-atr-frac", type=float, default=0.1)
-    ap.add_argument("--train-pct", type=float, default=0.6)
+    ap.add_argument("--commission-per-trade", type=float,
+                    default=_cd.DEFAULT_COMMISSION_USD)
+    ap.add_argument("--slippage-atr-frac", type=float,
+                    default=_cd.DEFAULT_SLIPPAGE_ATR_FRAC)
+    ap.add_argument("--train-pct", type=float,
+                    default=_cd.DEFAULT_TRAIN_PCT)
     ap.add_argument("--long-only", action="store_true")
     ap.add_argument("--min-test-trades", type=int, default=5)
     ap.add_argument("--out", default=str(ROOT / "docs" / "grid_results.md"))
@@ -127,8 +134,16 @@ def main() -> int:
     skipped: list[str] = []
     failed_reconcile: list[str] = []
 
+    # Unified mpu source — `dashboards.components.state.resolve_money_per_unit`
+    # falls back to `data/symbol_info.json` for any ticker not in
+    # DEFAULT_MONEY_PER_UNIT. Pre-fix sweep_grid hardcoded TICKER_CONFIG
+    # while rebaseline used resolve_money_per_unit, so the same cell could
+    # produce different metrics across the two scripts.
+    from dashboards.components.state import resolve_money_per_unit
+
     for ticker in TICKERS:
-        money_per_unit, default_lots = TICKER_CONFIG[ticker]
+        money_per_unit = resolve_money_per_unit(ticker)
+        _, default_lots = TICKER_CONFIG[ticker]
         lots = args.lots if args.lots > 0 else default_lots
         for tf in TIMEFRAMES:
             parquet = ROOT / "data" / f"{ticker}_{tf}.parquet"

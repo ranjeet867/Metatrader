@@ -1,0 +1,598 @@
+"""
+B_🔬_Replay_Parity.py — UI for running and inspecting replay-parity tests.
+
+Replay-parity is the v2 safety invariant: backtest P&L must match the
+bar-by-bar replay engine within $0.01. Required before a strategy can
+be promoted to live.
+
+Sections:
+  1. Status overview — every registered strategy with last-pass status,
+     divergence, recorded-at, plus the data parquet used.
+  2. Run-one panel — pick a strategy + ticker + tf, run inline, see
+     backtest vs replay numbers + elapsed time.
+  3. Run-all bulk — one click to refresh every strategy's parity record
+     against a default ticker × tf.
+  4. History log — all past parity passes from the parity_log table.
+"""
+from __future__ import annotations
+
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from core.config import load_config                             # noqa: E402
+from core.data import load_parquet                              # noqa: E402
+from core.parity_check import run_parity as _run_parity_engines  # noqa: E402
+from core.parity_gate import ParityGate                         # noqa: E402
+from core.symbol_info_loader import try_load as try_load_symbol_info  # noqa: E402
+from dashboards.components import theme                         # noqa: E402
+from dashboards.components.state import (                       # noqa: E402
+    DEFAULT_LOTS, DEFAULT_MONEY_PER_UNIT,
+    discover_data, discover_strategies,
+)
+
+DB_PATH = REPO / "data" / "v2.db"
+
+
+# Default (ticker, tf) per strategy for the Run-all button.
+DEFAULT_CELLS: dict[str, tuple[str, str]] = {
+    "ema_cross":         ("US100.cash", "D1"),
+    "ema_pullback":      ("USDJPY",     "D1"),
+    "donchian_breakout": ("US100.cash", "D1"),
+    "rsi_meanrev":       ("GBPUSD",     "D1"),
+    "bbands_meanrev":    ("XAUUSD",     "D1"),
+    "vol_breakout":      ("US100.cash", "D1"),
+    "ibs":               ("US100.cash", "D1"),
+    "inside_bar":        ("US100.cash", "D1"),
+    "orb":               ("US100.cash", "M15"),
+    "overnight_drift":   ("US100.cash", "M15"),
+    "first30_meanrev":   ("US100.cash", "M15"),
+}
+
+
+def _load_history() -> pd.DataFrame:
+    """Read every recorded parity pass into a DataFrame."""
+    if not DB_PATH.exists():
+        return pd.DataFrame(columns=["strategy", "passed_at_utc",
+                                       "divergence_dollars"])
+    with sqlite3.connect(str(DB_PATH)) as c:
+        try:
+            return pd.read_sql_query(
+                "SELECT strategy, passed_at_utc, divergence_dollars "
+                "FROM parity_log ORDER BY passed_at_utc DESC",
+                c,
+            )
+        except (pd.io.sql.DatabaseError, sqlite3.OperationalError):
+            return pd.DataFrame(columns=["strategy", "passed_at_utc",
+                                           "divergence_dollars"])
+
+
+def _run_parity(strategies, sname: str, ticker: str, tf: str,
+                  cfg, gate: ParityGate) -> dict:
+    """Run a single parity test. Returns a dict with the result."""
+    if sname not in strategies:
+        return {"status": "skip", "msg": f"strategy '{sname}' not registered"}
+    StratCls, ParamsCls = strategies[sname]
+    parquet = REPO / "data" / f"{ticker}_{tf}.parquet"
+    if not parquet.exists():
+        return {"status": "skip",
+                "msg": f"no parquet for {ticker}_{tf}"}
+    df = load_parquet(parquet)
+    try:
+        strat = StratCls() if ParamsCls is None else StratCls(ParamsCls())
+    except Exception as e:
+        return {"status": "skip", "msg": f"instantiate failed: {e}"}
+
+    sym_info = try_load_symbol_info(ticker)
+    t0 = time.time()
+    pr = _run_parity_engines(
+        df, strat, symbol=ticker, tf=tf,
+        starting_balance=100_000,
+        lots=DEFAULT_LOTS.get(ticker, 0.1),
+        money_per_unit_price=resolve_money_per_unit(ticker),
+        commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+        risk_cfg=cfg, symbol_info=sym_info,
+    )
+    elapsed = time.time() - t0
+    bt, rp, div = pr.bt, pr.rp, pr.divergence_dollars
+    if div < 0.01:
+        gate.record_pass(sname, divergence_dollars=div)
+        status = "pass"
+    else:
+        status = "fail"
+    return {
+        "status": status,
+        "strategy": sname,
+        "ticker": ticker,
+        "tf": tf,
+        "n_bars": len(df),
+        "first_bar": str(df["time"].iloc[0]),
+        "last_bar": str(df["time"].iloc[-1]),
+        "bt_trades": bt.n_trades,
+        "rp_trades": rp.n_trades,
+        "bt_pnl": bt.sum_realized_pnl,
+        "rp_pnl": rp.sum_realized_pnl,
+        "divergence": div,
+        "elapsed_s": elapsed,
+    }
+
+
+@st.dialog("Parity test result", width="large")
+def _show_parity_result_dialog() -> None:
+    """Modal that pops up after any Run-click so the result is visible
+    immediately, no scrolling required."""
+    result = st.session_state.get("_p_last_result")
+    if result is None:
+        st.info("(no result yet)")
+        return
+    if result["status"] == "skip":
+        st.warning(f"⚠ Skipped: {result['msg']}")
+        if st.button("Close"):
+            st.session_state["_p_show_result_dialog"] = False
+            st.rerun()
+        return
+
+    ok = result["status"] == "pass"
+    color = "#15803d" if ok else "#7f1d1d"
+    label = "✅ PARITY PASSED" if ok else "⛔ PARITY FAILED"
+    st.markdown(
+        f"<div style='display:inline-block;background:{color};color:white;"
+        f"padding:8px 16px;border-radius:14px;font-weight:700;"
+        f"font-family:ui-monospace,Menlo,monospace;font-size:1.1rem;'>"
+        f"{label}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"`{result['strategy']}` on `{result['ticker']}` `{result['tf']}` — "
+        f"{result['n_bars']} bars  ·  "
+        f"{result['first_bar'][:10]} → {result['last_bar'][:10]}  ·  "
+        f"elapsed {result['elapsed_s']:.2f}s"
+    )
+    cols = st.columns(4)
+    cols[0].metric("BT trades", result["bt_trades"])
+    cols[1].metric("Replay trades", result["rp_trades"],
+                      delta=result["rp_trades"] - result["bt_trades"])
+    cols[2].metric("BT $", f"${result['bt_pnl']:+,.4f}")
+    cols[3].metric("Replay $", f"${result['rp_pnl']:+,.4f}",
+                      delta=f"${result['divergence']:.6f} divergence",
+                      delta_color=("normal" if ok else "inverse"))
+
+    if ok:
+        st.success(
+            f"**Recorded** for `{result['strategy']}`. The Live page now "
+            f"accepts this strategy for promotion until the 24h window "
+            f"expires."
+        )
+    else:
+        st.error(
+            f"⛔ Strategy is BLOCKED from live deployment until the "
+            f"divergence is resolved. Divergence ${result['divergence']:.4f} "
+            f"is above the $0.01 tolerance. Investigate engine drift in "
+            f"`core/replay.py` vs `core/backtest.py`."
+        )
+    if st.button("Close", type="primary"):
+        st.session_state["_p_show_result_dialog"] = False
+        st.rerun()
+
+
+def _format_status_pill(status: str | None, recent: bool) -> str:
+    if status is None:
+        return "<span style='background:#374151;color:white;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:600;'>NEVER RUN</span>"
+    if not recent:
+        return "<span style='background:#7c2d12;color:white;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:600;'>STALE (>24h)</span>"
+    return "<span style='background:#15803d;color:white;padding:2px 8px;border-radius:10px;font-size:0.72rem;font-weight:600;'>✅ FRESH</span>"
+
+
+def main() -> None:
+    st.set_page_config(page_title="Replay Parity", page_icon="🔬",
+                        layout="wide")
+    theme.inject_css()
+    st.title("🔬  Replay-Parity")
+    st.caption(
+        "Required v2 safety invariant: backtest P&L must equal bar-by-bar "
+        "replay P&L within $0.01. Until a strategy passes, it can't be "
+        "promoted to live. Recorded passes are valid for 24h."
+    )
+
+    cfg = load_config()
+    strategies = discover_strategies()
+    data_index = discover_data()
+    gate = ParityGate(DB_PATH)
+
+    # ---- 1. Status overview ----
+    st.markdown("## 📋  Status overview")
+    st.caption(
+        "All registered strategies with their last-pass status. **FRESH** "
+        "= passed within last 24h, **STALE** = older, **NEVER RUN** = "
+        "no record. Click any row's button to refresh."
+    )
+
+    rows = []
+    for sname in sorted(strategies.keys()):
+        last = gate.last_pass_for(sname)
+        recent = gate.is_recent(sname)
+        ticker, tf = DEFAULT_CELLS.get(sname, ("US100.cash", "D1"))
+        rows.append({
+            "name": sname,
+            "ticker": ticker,
+            "tf": tf,
+            "last_pass": last,
+            "recent": recent,
+        })
+
+    n_passed = sum(1 for r in rows if r["recent"])
+    n_stale = sum(1 for r in rows if r["last_pass"] is not None
+                    and not r["recent"])
+    n_never = sum(1 for r in rows if r["last_pass"] is None)
+
+    kpi = st.columns(4)
+    kpi[0].metric("Total strategies", len(rows))
+    kpi[1].metric("✅ Fresh (<24h)", n_passed)
+    kpi[2].metric("⚠ Stale", n_stale, delta_color="inverse")
+    kpi[3].metric("⛔ Never run", n_never, delta_color="inverse")
+
+    # Status table — per-row rerun button
+    for r in rows:
+        with st.container(border=True):
+            head = st.columns([3, 2, 2, 1])
+            pill = _format_status_pill(r["last_pass"], r["recent"])
+            head[0].markdown(
+                f"{pill}  &nbsp;**`{r['name']}`** "
+                f"on `{r['ticker']}` `{r['tf']}`",
+                unsafe_allow_html=True,
+            )
+            if r["last_pass"]:
+                ts, div = r["last_pass"]
+                head[1].markdown(
+                    f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                    f"font-size:0.78rem;line-height:1.4;'>"
+                    f"<span style='color:#9ca3af;'>last pass</span> "
+                    f"{ts.strftime('%Y-%m-%d %H:%M')} UTC<br>"
+                    f"<span style='color:#9ca3af;'>divergence</span> "
+                    f"<b>${div:.6f}</b></div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                head[1].markdown(
+                    "<span style='color:#9ca3af;font-size:0.85rem;'>"
+                    "(no parity record yet)</span>",
+                    unsafe_allow_html=True,
+                )
+            # Override (ticker, tf) per row
+            avail_tfs = sorted(data_index.get(r["ticker"], {}).keys()) \
+                if r["ticker"] in data_index else [r["tf"]]
+            new_tf = head[2].selectbox(
+                "tf override", avail_tfs,
+                index=avail_tfs.index(r["tf"]) if r["tf"] in avail_tfs else 0,
+                key=f"_p_tf_{r['name']}",
+                label_visibility="collapsed",
+            )
+            if head[3].button("▶ Run", key=f"_p_run_{r['name']}",
+                                type="primary", use_container_width=True):
+                with st.spinner(f"Running parity for {r['name']}..."):
+                    result = _run_parity(strategies, r["name"],
+                                            r["ticker"], new_tf, cfg, gate)
+                st.session_state["_p_last_result"] = result
+                # Open modal that's impossible to miss
+                st.session_state["_p_show_result_dialog"] = True
+                st.rerun()
+
+    # Dialog opens immediately after a Run-click so the result can't
+    # be missed even with 11 rows above the fold.
+    if st.session_state.get("_p_show_result_dialog"):
+        _show_parity_result_dialog()
+
+    # The result modal handles per-click visibility. For the user who
+    # comes back later, render the most-recent result inline at the top.
+    if "_p_last_result" in st.session_state:
+        result = st.session_state["_p_last_result"]
+        if result["status"] != "skip":
+            with st.expander(
+                f"🧪  Most recent run: `{result['strategy']}` "
+                f"({result['status'].upper()})",
+                expanded=False,
+            ):
+                cols = st.columns(4)
+                cols[0].metric("BT trades", result["bt_trades"])
+                cols[1].metric("Replay trades", result["rp_trades"])
+                cols[2].metric("Divergence",
+                                  f"${result['divergence']:.6f}")
+                cols[3].metric("Elapsed",
+                                  f"{result['elapsed_s']:.2f}s")
+
+    # ---- 1b. Active deployments (Composer cells) ----
+    # Shows the EXACT (variant, ticker, tf) cells from your Portfolio
+    # Composer / Operations page so you can refresh parity for the
+    # specific deployments you're trading — not just the base
+    # strategies. Variant names like `ema_cross_9_20` are resolved to
+    # their base `ema_cross` for the parity gate.
+    st.markdown("---")
+    st.markdown("## 📦  Active deployments")
+    st.caption(
+        "Every paper / live deployment from your accounts. The parity "
+        "gate is keyed by BASE strategy name (e.g. `ema_cross`), so a "
+        "single pass clears every variant of that base. Click ▶ Run to "
+        "refresh the cell's specific (ticker, tf) combination."
+    )
+
+    from core import account_manager, deployment as dep_mod
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+
+    try:
+        accounts = account_manager.list_accounts()
+    except Exception:
+        accounts = []
+
+    all_deployments = []
+    for acct in accounts:
+        try:
+            for d in dep_mod.load_deployments(acct.login):
+                if d.status in ("paper", "live", "halted", "paused"):
+                    all_deployments.append((acct, d))
+        except Exception:
+            continue
+
+    if not all_deployments:
+        st.info(
+            "_No deployments configured yet. Use the Portfolio Composer "
+            "or Operations page to create some, then come back here to "
+            "refresh parity._"
+        )
+    else:
+        # Summary by status
+        n_total = len(all_deployments)
+        n_live = sum(1 for _, d in all_deployments if d.status == "live")
+        n_paper = sum(1 for _, d in all_deployments if d.status == "paper")
+        n_other = n_total - n_live - n_paper
+
+        # Parity status per variant (resolved to base)
+        n_fresh = n_stale = n_never = 0
+        for _, d in all_deployments:
+            base = resolve_base_strategy(d.strategy, strategies) or d.strategy
+            last = gate.last_pass_for(base)
+            if last is None:
+                n_never += 1
+            elif gate.is_recent(base):
+                n_fresh += 1
+            else:
+                n_stale += 1
+
+        sk = st.columns(5)
+        sk[0].metric("Total deployments", n_total)
+        sk[1].metric("🟢 LIVE", n_live)
+        sk[2].metric("🟡 PAPER", n_paper)
+        sk[3].metric("✅ Fresh parity", n_fresh)
+        sk[4].metric(
+            "⚠ Stale / Never",
+            n_stale + n_never,
+            delta_color="inverse" if (n_stale + n_never) > 0 else "off",
+        )
+
+        if (n_stale + n_never) > 0:
+            st.warning(
+                f"⚠ {n_stale + n_never} of {n_total} deployments have "
+                f"stale or no parity record. Click ▶ Run on each to "
+                f"refresh, or use 'Run all stale' below."
+            )
+            if st.button(
+                f"🚀 Run parity for all {n_stale + n_never} stale/never "
+                f"deployments",
+                type="primary", use_container_width=True,
+                key="_p_run_all_stale_deps",
+            ):
+                run_results = []
+                stale_deps = []
+                for acct, d in all_deployments:
+                    base = (resolve_base_strategy(d.strategy, strategies)
+                             or d.strategy)
+                    last = gate.last_pass_for(base)
+                    if last is None or not gate.is_recent(base):
+                        stale_deps.append((acct, d, base))
+                if stale_deps:
+                    prog = st.progress(0.0, text="Starting...")
+                    seen_bases = set()
+                    for i, (acct, d, base) in enumerate(stale_deps):
+                        # Avoid running parity twice for the same base
+                        # if multiple variants point to it
+                        if base in seen_bases:
+                            continue
+                        seen_bases.add(base)
+                        prog.progress(
+                            (i + 1) / len(stale_deps),
+                            text=f"Running {base} × {d.ticker} × {d.tf}...",
+                        )
+                        try:
+                            result = _run_parity(
+                                strategies, base, d.ticker, d.tf,
+                                cfg, gate,
+                            )
+                            run_results.append(result)
+                        except Exception as e:
+                            run_results.append({
+                                "strategy": base, "ticker": d.ticker,
+                                "tf": d.tf, "status": "error",
+                                "msg": str(e),
+                            })
+                    prog.empty()
+                    n_pass = sum(1 for r in run_results
+                                  if r.get("status") == "pass")
+                    n_fail = sum(1 for r in run_results
+                                  if r.get("status") == "fail")
+                    if n_fail == 0 and n_pass > 0:
+                        st.success(
+                            f"✅ All {n_pass} parity check(s) PASSED. "
+                            f"Refresh the page to see updated badges."
+                        )
+                    else:
+                        st.error(
+                            f"⛔ {n_fail} FAIL · {n_pass} PASS. See "
+                            f"per-row results below."
+                        )
+                    st.rerun()
+
+        # Per-deployment row with Run button
+        for acct, d in all_deployments:
+            base = resolve_base_strategy(d.strategy, strategies) or d.strategy
+            last = gate.last_pass_for(base)
+            recent = gate.is_recent(base)
+            with st.container(border=True):
+                row = st.columns([3, 2, 2, 1])
+                # Status pill (paper / live)
+                if d.status == "live":
+                    status_pill = (
+                        "<span style='background:#15803d;color:white;"
+                        "padding:2px 8px;border-radius:10px;font-size:0.7rem;"
+                        "font-weight:600;'>🟢 LIVE</span>"
+                    )
+                elif d.status == "paper":
+                    status_pill = (
+                        "<span style='background:#b08800;color:white;"
+                        "padding:2px 8px;border-radius:10px;font-size:0.7rem;"
+                        "font-weight:600;'>🟡 PAPER</span>"
+                    )
+                else:
+                    status_pill = (
+                        f"<span style='background:#7f1d1d;color:white;"
+                        f"padding:2px 8px;border-radius:10px;font-size:0.7rem;"
+                        f"font-weight:600;'>⛔ {d.status.upper()}</span>"
+                    )
+                # Parity badge
+                parity_pill = _format_status_pill(last, recent)
+                base_label = (f" → base `{base}`"
+                              if base != d.strategy else "")
+                row[0].markdown(
+                    f"{status_pill} {parity_pill}<br>"
+                    f"&nbsp;**`{d.strategy}`**{base_label}<br>"
+                    f"&nbsp;`{d.ticker}` `{d.tf}` "
+                    f"({'long' if d.long_only else 'bidir'})",
+                    unsafe_allow_html=True,
+                )
+                if last:
+                    ts, div = last
+                    row[1].markdown(
+                        f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                        f"font-size:0.78rem;line-height:1.4;'>"
+                        f"<span style='color:#9ca3af;'>last pass</span> "
+                        f"{ts.strftime('%Y-%m-%d %H:%M')} UTC<br>"
+                        f"<span style='color:#9ca3af;'>divergence</span> "
+                        f"<b>${div:.6f}</b></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    row[1].markdown(
+                        "<span style='color:#9ca3af;font-size:0.85rem;'>"
+                        "(no parity record yet)</span>",
+                        unsafe_allow_html=True,
+                    )
+                row[2].markdown(
+                    f"<div style='font-family:ui-monospace,Menlo,monospace;"
+                    f"font-size:0.78rem;color:#9ca3af;'>"
+                    f"acct #{acct.login}<br>"
+                    f"risk {d.risk_pct:.2f}% · cap {d.daily_cap_pct:.2f}%"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                if row[3].button(
+                    "▶ Run",
+                    key=f"_p_dep_run_{acct.login}_{d.deployment_id}",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    with st.spinner(
+                        f"Running parity for {base} × {d.ticker} × {d.tf}..."
+                    ):
+                        result = _run_parity(
+                            strategies, base, d.ticker, d.tf, cfg, gate,
+                        )
+                    st.session_state["_p_last_result"] = result
+                    st.session_state["_p_show_result_dialog"] = True
+                    st.rerun()
+
+    # ---- 2. Run-all bulk ----
+    st.markdown("---")
+    st.markdown("## 🚀  Bulk runner")
+    st.caption(
+        "Run parity for every registered strategy at its default ticker × "
+        "tf. Total time: <2 seconds for 11 strategies. Results show below."
+    )
+    if st.button("▶  Run all 11 strategies",
+                   type="primary", use_container_width=True,
+                   key="_p_run_all"):
+        run_results = []
+        prog = st.progress(0.0, text="Starting...")
+        total = len(strategies)
+        for i, sname in enumerate(sorted(strategies.keys()), 1):
+            ticker, tf = DEFAULT_CELLS.get(sname, ("US100.cash", "D1"))
+            prog.progress(i / total,
+                            text=f"{i}/{total}  {sname} × {ticker} × {tf}")
+            result = _run_parity(strategies, sname, ticker, tf, cfg, gate)
+            run_results.append(result)
+        prog.empty()
+        n_pass = sum(1 for r in run_results if r["status"] == "pass")
+        n_fail = sum(1 for r in run_results if r["status"] == "fail")
+        n_skip = sum(1 for r in run_results if r["status"] == "skip")
+        if n_fail == 0 and n_skip == 0:
+            st.success(
+                f"✅ All {n_pass} strategies passed parity in "
+                f"{sum(r.get('elapsed_s', 0) for r in run_results):.2f}s."
+            )
+        else:
+            st.warning(
+                f"{n_pass} passed · {n_fail} failed · {n_skip} skipped"
+            )
+        # Detailed results
+        df_res = pd.DataFrame([
+            {
+                "Strategy": r.get("strategy", "?"),
+                "Status": ("✅" if r["status"] == "pass"
+                            else "⛔" if r["status"] == "fail"
+                            else "⚠"),
+                "Ticker": r.get("ticker", "—"),
+                "TF": r.get("tf", "—"),
+                "Bars": r.get("n_bars", "—"),
+                "BT trades": r.get("bt_trades", "—"),
+                "RP trades": r.get("rp_trades", "—"),
+                "Divergence $": (f"${r['divergence']:.6f}"
+                                  if r["status"] in ("pass", "fail") else "—"),
+                "Elapsed": (f"{r['elapsed_s']:.2f}s"
+                             if "elapsed_s" in r else "—"),
+                "Note": r.get("msg", ""),
+            } for r in run_results
+        ])
+        st.dataframe(df_res, use_container_width=True,
+                       height=min(540, 38 * (len(df_res) + 1)))
+        st.rerun()    # refresh the status table too
+
+    # ---- 3. History log ----
+    st.markdown("---")
+    st.markdown("## 📜  Pass history")
+    history = _load_history()
+    if history.empty:
+        st.caption("(no passes recorded yet — click Run to record one)")
+        return
+    history["passed_at_utc"] = pd.to_datetime(history["passed_at_utc"],
+                                                 utc=True, errors="coerce")
+    history["divergence_dollars"] = history["divergence_dollars"].apply(
+        lambda v: f"${v:.6f}"
+    )
+    st.dataframe(
+        history.rename(columns={
+            "strategy": "Strategy",
+            "passed_at_utc": "Passed at UTC",
+            "divergence_dollars": "Divergence $",
+        }),
+        use_container_width=True,
+        height=min(420, 36 * (len(history) + 1)),
+    )
+
+
+main()

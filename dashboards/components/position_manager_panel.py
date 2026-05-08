@@ -45,22 +45,90 @@ def _style_pnl(v):
 
 def render(*, pm: PositionManager, container=None) -> None:
     target = container or st
-    target.markdown("### 💼  Position manager")
+
+    # Header strip with title + freshness + refresh button
+    from datetime import datetime, timezone
+
+    # Force-refresh wins over cache-staleness on every render. Streamlit
+    # reruns this whole component on every interaction so we attach the
+    # fetch timestamp to session state — that's what powers the freshness
+    # display.
+    fetched_at_key = "_pm_fetched_at_utc"
+    refresh_key = "_pm_force_refresh_token"
+    head = target.columns([3, 1, 1])
+    head[0].markdown("### 💼  Position manager")
+    if head[2].button("🔄 Refresh now",
+                          help="Force a fresh positions_get call against "
+                               "the bridge. The displayed positions are "
+                               "ALWAYS what the bridge returns this tick — "
+                               "we don't cache results across calls.",
+                          key="pm_force_refresh",
+                          width="stretch"):
+        # Bumping the token forces Streamlit to rerun + we re-fetch below
+        st.session_state[refresh_key] = (
+            st.session_state.get(refresh_key, 0) + 1
+        )
+        st.session_state[fetched_at_key] = (
+            datetime.now(timezone.utc).isoformat()
+        )
 
     try:
+        fetch_t0 = datetime.now(timezone.utc)
         positions = pm.list_open()
+        fetch_age_ms = int(
+            (datetime.now(timezone.utc) - fetch_t0).total_seconds() * 1000
+        )
+        st.session_state[fetched_at_key] = fetch_t0.isoformat()
+        # Render the freshness chip in head[1]
+        head[1].markdown(
+            f"<div style='text-align:right;font-family:ui-monospace,"
+            f"Menlo,monospace;font-size:0.78rem;color:#16a34a;'>"
+            f"⚡ live · {fetch_age_ms}ms</div>"
+            f"<div style='text-align:right;font-size:0.7rem;color:#6b7280;'>"
+            f"fetched {fetch_t0.strftime('%H:%M:%S')} UTC</div>",
+            unsafe_allow_html=True,
+        )
     except Exception as e:
         msg = str(e)
         if "unknown method" in msg or "not implemented" in msg.lower():
             target.warning(
-                "ℹ Your MT5 bridge EA doesn't yet implement the position "
-                "methods (`positions_get`, `position_close`, "
-                "`history_deals_get`). Upgrade the bridge EA to enable "
-                "live position management. Until then this panel is "
-                "read-only — open a trade in MT5 directly to test.")
-            target.caption(
-                "See `docs/RUNBOOK.md` → 'Upgrading the MT5 bridge for "
-                "Phase 2.5 position management'.")
+                "ℹ Your MT5 bridge EA is responding but doesn't implement "
+                "the Phase 2.5 position methods (`positions_get`, "
+                "`position_close`, `history_deals_get`). Recompile the "
+                "EA to pick up the patch — instructions below. "
+                "Until then this panel is read-only.")
+            with target.expander(
+                "🔧  Recompile the bridge EA (~30 seconds)",
+                expanded=True,
+            ):
+                target.markdown(
+                    "Your `MT5BridgeFile.mq5` source has already been "
+                    "patched on disk with the Phase 2.5 handlers. You "
+                    "just need to recompile and reattach:\n\n"
+                    "1. **Switch to MetaEditor** "
+                    "(it's already open if you've been editing the EA — "
+                    "use Cmd+Tab, or in MT5 click *Tools → "
+                    "MetaQuotes Language Editor*).\n"
+                    "2. Make sure `MT5BridgeFile.mq5` is the active tab "
+                    "(version should now read `1.1`).\n"
+                    "3. Press **F7** (or click the *Compile* button in "
+                    "the toolbar). Output panel should show "
+                    "`0 errors, 0 warnings`.\n"
+                    "4. Switch back to **MetaTrader 5**.\n"
+                    "5. In the *Navigator → Expert Advisors* panel, "
+                    "right-click `MT5BridgeFile` → **Refresh** (or "
+                    "detach the EA from your chart and re-drag it on).\n"
+                    "6. Check the *Experts* log — should show "
+                    "`MT5BridgeFile: ready. Watching MQL5/Files/mt5qt/"
+                    "req/`.\n"
+                    "7. Refresh this dashboard page — the warning is "
+                    "gone and the table populates with live positions.\n\n"
+                    "Fallback: if recompile fails, install "
+                    "[`V2Bridge.mq5`](file://"
+                    + str(__file__).rsplit("/dashboards", 1)[0]
+                    + "/mql5/V2Bridge.mq5) — full procedure in "
+                    "`docs/RUNBOOK.md` § 14."
+                )
         else:
             target.error(f"Could not query broker: {msg}")
         return
@@ -103,7 +171,7 @@ def render(*, pm: PositionManager, container=None) -> None:
         f"{avg_r:+.2f}</b></div>",
         unsafe_allow_html=True,
     )
-    with head[1].popover("⛔  Close ALL", use_container_width=True):
+    with head[1].popover("⛔  Close ALL", width="stretch"):
         st.markdown(
             f"Type `{CLOSE_ALL_PHRASE}` exactly to confirm closing every "
             f"open position on this account.")
@@ -145,7 +213,7 @@ def render(*, pm: PositionManager, container=None) -> None:
                  "stop": "{:.5f}", "target": "{:.5f}",
                  "$ pnl": "${:+,.2f}", "R": "{:+.2f}"}, na_rep="—")
     )
-    target.dataframe(styled, use_container_width=True,
+    target.dataframe(styled, width="stretch",
                        height=min(420, 36 * (n + 1)))
 
     # Per-row Close — inline buttons with the position context next to them.
@@ -167,10 +235,149 @@ def render(*, pm: PositionManager, container=None) -> None:
                if p.unrealized_r is not None else "")
             + "</span>", unsafe_allow_html=True)
         if c[2].button("Close", key=f"pm_close_{p.ticket}",
-                          type="secondary", use_container_width=True):
+                          type="secondary", width="stretch"):
             res = pm.close_one(p.ticket, reason="manual_close_ui")
             if res.ok:
                 st.toast(f"Closed #{p.ticket} (${res.realized_pnl:+,.2f})")
+                # Save success result so banner persists across rerun
+                st.session_state["_pm_last_close_result"] = {
+                    "ok": True,
+                    "ticket": res.ticket,
+                    "pnl": res.realized_pnl,
+                }
             else:
-                st.toast(f"Close failed: {res.error}", icon="⛔")
+                # FULL error context — not just a one-line toast.
+                # Persist to session state so it survives the rerun.
+                # Use getattr fallbacks so the panel survives even if the
+                # caller (or hot-reloader) is running an OLDER CloseResult
+                # without `detailed_error` / `bridge_response` / `attempts`.
+                detail = getattr(res, "detailed_error", None)
+                if not detail:
+                    # Synthesize the same string from primitive fields so the
+                    # UI never shows a bare 'failed'.
+                    parts = []
+                    if getattr(res, "error", ""):
+                        parts.append(res.error)
+                    rc = getattr(res, "retcode", 0) or 0
+                    if rc and rc != 0:
+                        parts.append(f"retcode={rc}")
+                    detail = " · ".join(parts) if parts else (
+                        "close failed (older CloseResult class — restart "
+                        "Streamlit to pick up the new error-detail fields)"
+                    )
+                st.session_state["_pm_last_close_result"] = {
+                    "ok": False,
+                    "ticket": res.ticket,
+                    "detailed_error": detail,
+                    "retcode": getattr(res, "retcode", 0),
+                    "bridge_response": getattr(res, "bridge_response", {})
+                                          or {},
+                    "attempts": getattr(res, "attempts", 1),
+                }
+                st.toast(f"Close FAILED #{p.ticket}: {detail[:80]}",
+                            icon="⛔")
             st.rerun()
+
+    # ---- Persistent banner for the most recent close result ----
+    last = st.session_state.get("_pm_last_close_result")
+    if last is not None:
+        target.markdown("---")
+        if last["ok"]:
+            with target.container(border=True):
+                col_a, col_b = st.columns([5, 1])
+                col_a.success(
+                    f"✅ Closed #{last['ticket']} for "
+                    f"${last['pnl']:+,.2f} realized P&L"
+                )
+                if col_b.button("Dismiss", key="_pm_dismiss_ok"):
+                    st.session_state.pop("_pm_last_close_result", None)
+                    st.rerun()
+        else:
+            with target.container(border=True):
+                st.error(
+                    f"⛔ **Close FAILED for ticket #{last['ticket']}** "
+                    f"after {last.get('attempts', 1)} attempt(s)"
+                )
+                st.markdown(
+                    f"**Error:**  `{last['detailed_error']}`"
+                )
+                # Common retcode → human translation
+                rc = last.get("retcode", 0)
+                rc_help = {
+                    10004: "Requote — broker rejected fill price; will retry.",
+                    10006: "Request rejected — likely bad price/lots; check market hours.",
+                    10009: "Request completed (this should NOT be ok=False — check bridge).",
+                    10013: "Invalid request (params malformed).",
+                    10014: "Invalid volume (lots below broker min or above max).",
+                    10015: "Invalid price (off-quote — broker not accepting this price).",
+                    10016: "Invalid stops (SL/TP too close to current price — broker FREEZE_LEVEL).",
+                    10017: "Trade disabled — account may be read-only or symbol disabled.",
+                    10018: "Market closed — outside trading hours.",
+                    10019: "Not enough money — margin requirements not met.",
+                    10020: "Prices changed — requote.",
+                    10021: "No quotes — symbol not subscribed or feed dead.",
+                    10025: "No changes (when modifying SL/TP — already that value).",
+                    10026: "Server disabled autotrading.",
+                    10027: "Client (terminal) disabled autotrading — check the AutoTrading button in MT5 toolbar.",
+                    10028: "Order locked by another request.",
+                    10030: "Unsupported filling mode — try ORDER_FILLING_IOC instead of FOK.",
+                    10031: "No connection to trade server.",
+                    10038: "Position closed by another order — already gone.",
+                }
+                if rc in rc_help:
+                    st.info(f"Retcode {rc}: {rc_help[rc]}")
+                elif rc:
+                    st.caption(
+                        f"Retcode {rc} not in known list — check MT5 docs at "
+                        f"https://www.mql5.com/en/docs/constants/errorswarnings/"
+                        f"enum_trade_return_codes for the full table."
+                    )
+                # Bridge response, raw
+                with st.expander("🔍  Raw bridge response (debug)",
+                                    expanded=False):
+                    st.json(last.get("bridge_response") or {})
+                # Action buttons
+                bcols = st.columns(3)
+                if bcols[0].button("🔄 Retry close",
+                                      key="_pm_retry_close",
+                                      type="primary",
+                                      width="stretch"):
+                    res = pm.close_one(last["ticket"],
+                                          reason="manual_retry_ui")
+                    if res.ok:
+                        st.session_state["_pm_last_close_result"] = {
+                            "ok": True, "ticket": res.ticket,
+                            "pnl": res.realized_pnl,
+                        }
+                    else:
+                        # Same getattr fallback for stale CloseResult
+                        retry_detail = getattr(res, "detailed_error", None)
+                        if not retry_detail:
+                            parts = []
+                            if getattr(res, "error", ""):
+                                parts.append(res.error)
+                            rc = getattr(res, "retcode", 0) or 0
+                            if rc:
+                                parts.append(f"retcode={rc}")
+                            retry_detail = (" · ".join(parts)
+                                              or "close failed")
+                        st.session_state["_pm_last_close_result"] = {
+                            "ok": False, "ticket": res.ticket,
+                            "detailed_error": retry_detail,
+                            "retcode": getattr(res, "retcode", 0),
+                            "bridge_response": getattr(res, "bridge_response",
+                                                          {}) or {},
+                            "attempts": getattr(res, "attempts", 1),
+                        }
+                    st.rerun()
+                if bcols[1].button("📋 Copy error",
+                                      key="_pm_copy_err",
+                                      width="stretch",
+                                      help="Selects the error text below "
+                                            "for copy-paste"):
+                    st.code(last["detailed_error"], language="text")
+                if bcols[2].button("Dismiss",
+                                      key="_pm_dismiss_err",
+                                      width="stretch"):
+                    st.session_state.pop("_pm_last_close_result", None)
+                    st.rerun()

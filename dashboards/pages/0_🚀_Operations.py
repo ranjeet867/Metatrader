@@ -43,6 +43,7 @@ from dashboards.components import (   # noqa: E402
     live_equity_chart,
     position_manager_panel,
     statement_panel,
+    system_status_panel,
     theme,
 )
 from dashboards.components.account_switcher import (   # noqa: E402
@@ -62,6 +63,56 @@ def _bridge() -> MT5AccountClient:
     return MT5AccountClient()
 
 
+def _open_positions_snapshot(login: int, *, deployments=None,
+                                summary=None) -> list:
+    """Build a list of OpenPosition for the system_status_panel.
+
+    Source order:
+      1. summary.open_positions (from StatementReader) if populated
+      2. Empty list otherwise — panel renders, just without collisions
+
+    The list ties each open position to the deployment_id that
+    presumably owns it. We match by symbol; if multiple deployments
+    trade the same symbol the collision check will surface them.
+    """
+    from core.position_guard import OpenPosition
+
+    if summary is None or not getattr(summary, "open_positions", None):
+        return []
+    if deployments is None:
+        try:
+            deployments = dep_mod.load_deployments(login)
+        except Exception:
+            deployments = []
+
+    # Build a (symbol → first-deployment-id) map for ownership inference
+    sym_to_dep: dict[str, str] = {}
+    for d in deployments:
+        sym_to_dep.setdefault(d.ticker, d.deployment_id)
+
+    out = []
+    for p in summary.open_positions:
+        try:
+            sym = getattr(p, "symbol", None) or p.get("symbol")
+            side = getattr(p, "type", None) or p.get("type", "") or "LONG"
+            lots = float(getattr(p, "volume", 0.0)
+                            or p.get("volume", 0.0) or 0.0)
+            opened = (str(getattr(p, "opened_at_utc", "")
+                          or p.get("opened_at_utc", "") or ""))
+        except Exception:
+            continue
+        if not sym:
+            continue
+        out.append(OpenPosition(
+            deployment_id=sym_to_dep.get(sym, f"unknown:{sym}"),
+            symbol=sym,
+            side=str(side).upper(),
+            lots=lots,
+            opened_at_utc=opened,
+        ))
+    return out
+
+
 def _build_clock(account: account_manager.Account) -> FtmoClock:
     try:
         tz = ZoneInfo(account.user_tz)
@@ -71,8 +122,36 @@ def _build_clock(account: account_manager.Account) -> FtmoClock:
 
 
 def _ensure_seed_deployments(login: int) -> None:
+    """Seed the recommended portfolio ONCE per account, never again.
+
+    Pre-fix this re-seeded every time `load_deployments(login)` came
+    back empty — so a user who deleted every deployment (e.g. to start
+    fresh from the Composer's Recommended preset) saw the same 6 cells
+    pop back on the next render. The remove button looked broken.
+
+    The marker file `.seeded` records that the initial seed has already
+    happened. Once written, this function becomes a no-op forever for
+    that account, regardless of how many deployments exist.
+
+    To force a re-seed: delete `data/accounts/<login>/.seeded` then
+    reload the Operations page."""
+    db_path = account_manager.get_db_path(login)
+    marker = db_path.parent / ".seeded"
+    if marker.exists():
+        return
     if not dep_mod.load_deployments(login):
         dep_mod.seed_survivor_deployments(login)
+    # Always write the marker, even if the user already had deployments
+    # before we reached this code path. Never auto-seed this account
+    # again, period.
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"Seeded at first Operations-page render. "
+            f"Delete this file to force a re-seed.\n"
+        )
+    except OSError:
+        pass
 
 
 def _add_deployment_form(login: int) -> None:
@@ -212,6 +291,21 @@ def main() -> None:
     # 5. KPI strip (full width)
     kpi_strip.render(account=account, summary=summary, clock=clock)
 
+    # 5b. System status (circuit breaker + position-collision view)
+    # Build the open-positions snapshot from the bridge if it's reachable;
+    # falls back to an empty list when bridge is offline so the panel
+    # still renders (showing only realised PnL).
+    open_positions_snapshot = _open_positions_snapshot(
+        login, deployments=None, summary=summary,
+    )
+    try:
+        system_status_panel.render(
+            login=login, db_path=db_path, mode="live",
+            open_positions=open_positions_snapshot,
+        )
+    except Exception as e:        # pragma: no cover — defensive
+        st.caption(f"⚠ system-status panel error: {e}")
+
     if summary is None:
         # Differentiate offline-bridge vs old-bridge-EA. The latter is
         # common when the user hasn't upgraded their MT5 EA yet.
@@ -243,8 +337,23 @@ def main() -> None:
     # ----- Deployments tab -----
     with tab_dep:
         deployments = dep_mod.load_deployments(login)
+        # Pull broker positions ONCE for all cards so the holding-badge
+        # can show 💼 LONG @ entry · +$X inline without N bridge calls.
+        broker_positions_for_cards = []
+        try:
+            from core.mt5_account import MT5AccountClient
+            broker_positions_for_cards = MT5AccountClient().positions_get()
+        except Exception:
+            pass
+        # Header summary so the user sees the holding/flat split at a glance
+        from dashboards.components.holding_badge import summarize as _hb_sum
+        sm = _hb_sum(deployments, broker_positions_for_cards)
         st.markdown(
             f"**{len(deployments)} deployments configured** for this account."
+            f"  ·  💼 {sm['n_holding']} holding"
+            f"  ·  ⚪ {sm['n_flat']} flat"
+            + (f"  ·  ⛔ {sm['n_halted']} halted"
+               if sm['n_halted'] else "")
         )
 
         for d in deployments:
@@ -284,6 +393,7 @@ def main() -> None:
                 on_go_live=_on_go_live, on_paper=_on_paper,
                 on_pause=_on_pause, on_remove=_on_remove,
                 on_backtest=_on_backtest,
+                broker_positions=broker_positions_for_cards,
             )
 
         _add_deployment_form(login)
@@ -309,6 +419,21 @@ def main() -> None:
             pm = PositionManager(account_login=login, bridge=bridge,
                                  db_path=db_path)
             position_manager_panel.render(pm=pm)
+        except AttributeError as e:
+            # Almost certainly a stale-class issue — Streamlit's hot
+            # reloader doesn't re-init dataclasses on edit. Tell the
+            # user exactly what to do.
+            st.error(
+                f"⛔ **Position manager: stale-class error** — "
+                f"`{e}`\n\n"
+                f"This means Streamlit is running an older version of "
+                f"a dataclass than the one on disk. Streamlit's "
+                f"hot-reloader doesn't pick up new fields/properties "
+                f"on dataclasses already loaded into memory.\n\n"
+                f"**Fix:** stop the dashboard (Ctrl+C in the terminal) "
+                f"and restart with `make dashboard`. Everything will "
+                f"work after a clean restart."
+            )
         except Exception as e:
             st.caption(f"(position manager unavailable: {e})")
 
@@ -342,6 +467,20 @@ def main() -> None:
 
     # ----- Settings tab -----
     with tab_settings:
+        # Phase-32 UI consolidation: account record + circuit breaker
+        # editors are now ALSO available on the unified ⚙️ Settings
+        # page (sidebar). The forms here remain functional and edit
+        # the same files, so values stay consistent — but the ⚙️
+        # Settings page is the canonical home going forward.
+        st.warning(
+            "⚙️ **These same settings are now also editable on the "
+            "[⚙️ Settings](/Settings) page** (sidebar). Both pages "
+            "edit the same files (`risk_config.json`, "
+            "`circuit_breaker.json`, account registry) — values stay "
+            "consistent. Use whichever feels easier; future cleanup "
+            "will remove the duplicates here.",
+            icon="ℹ️",
+        )
         st.markdown("### Per-account settings")
         with st.form(f"acct_settings_{login}"):
             cols = st.columns(2)
@@ -386,6 +525,81 @@ def main() -> None:
                     days_required=new_days_required,
                 )
                 st.success("Saved.")
+                st.rerun()
+
+        st.markdown("---")
+        st.markdown("### 🛡️  Circuit breaker")
+        st.caption(
+            "System-wide stop-loss / target halt. When the runner sees "
+            "any of these thresholds breached on this account, it "
+            "REFUSES new opens. HALT-level breaches also auto-pause "
+            "every live deployment so a runaway can't compound."
+        )
+        from core import circuit_breaker as cb
+        cb_cfg = cb.load_config(login)
+        with st.form(f"cb_settings_{login}"):
+            cb_cols = st.columns(3)
+            cb_dl = float(cb_cols[0].number_input(
+                "Daily loss limit ($)",
+                value=float(cb_cfg.daily_loss_dollars or 0.0),
+                step=100.0, min_value=0.0,
+                help="HALT if today's realised loss ≥ this. 0 = disabled.",
+            ))
+            cb_tl = float(cb_cols[1].number_input(
+                "Total loss limit ($)",
+                value=float(cb_cfg.total_loss_dollars or 0.0),
+                step=100.0, min_value=0.0,
+                help="HALT if lifetime realised loss ≥ this. 0 = disabled.",
+            ))
+            cb_dt = float(cb_cols[2].number_input(
+                "Daily target ($)",
+                value=float(cb_cfg.daily_target_dollars or 0.0),
+                step=100.0, min_value=0.0,
+                help="STOP_NEW (lock gains) when today's realised gain "
+                      "≥ this. 0 = disabled.",
+            ))
+            cb_cols2 = st.columns(3)
+            cb_tt = float(cb_cols2[0].number_input(
+                "Total target ($)",
+                value=float(cb_cfg.total_target_dollars or 0.0),
+                step=100.0, min_value=0.0,
+                help="STOP_NEW when lifetime realised gain ≥ this "
+                      "(e.g. FTMO 8% profit target). 0 = disabled.",
+            ))
+            cb_cl = int(cb_cols2[1].number_input(
+                "Max consec losses",
+                value=int(cb_cfg.max_consec_losses or 0),
+                step=1, min_value=0, max_value=20,
+                help="HALT after this many losing trades in a row. "
+                      "0 = disabled.",
+            ))
+            cb_op = int(cb_cols2[2].number_input(
+                "Max open positions",
+                value=int(cb_cfg.max_open_positions or 0),
+                step=1, min_value=0, max_value=50,
+                help="STOP_NEW once this many positions are open across "
+                      "all deployments. 0 = disabled.",
+            ))
+            cb_halt = st.checkbox(
+                "Auto-pause live deployments on HALT",
+                value=cb_cfg.halt_on_breach,
+                help="When ON and a HALT condition fires, every "
+                      "`live`-status deployment is flipped to `halted`. "
+                      "Paper deployments are left alone.",
+            )
+            if st.form_submit_button("Save circuit-breaker config",
+                                          type="primary"):
+                new_cb_cfg = cb.CircuitConfig(
+                    daily_loss_dollars=cb_dl or None,
+                    total_loss_dollars=cb_tl or None,
+                    daily_target_dollars=cb_dt or None,
+                    total_target_dollars=cb_tt or None,
+                    max_consec_losses=cb_cl or None,
+                    max_open_positions=cb_op or None,
+                    halt_on_breach=cb_halt,
+                )
+                cb.save_config(login, new_cb_cfg)
+                st.success("Circuit-breaker config saved.")
                 st.rerun()
 
         st.markdown("---")

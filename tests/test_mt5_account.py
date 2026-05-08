@@ -79,3 +79,23 @@ def test_symbol_info_error_response_raises():
     c = MT5AccountClient(bridge_call=bridge)
     with pytest.raises(RuntimeError, match="symbol_info"):
         c.symbol_info("BOGUS")
+
+
+def test_symbol_info_accepts_legacy_trade_prefixed_keys():
+    """Regression for the bug that made every symbol report tick_value=0:
+    MT5BridgeFile.mq5 emits `trade_tick_value`/`trade_tick_size`/
+    `trade_contract_size`, not the unprefixed names V2Bridge.mq5 uses.
+    Both must work."""
+    bridge = _mock_bridge({
+        "symbol_info": {"data": {
+            "trade_tick_size": 0.01,
+            "trade_tick_value": 0.5,
+            "trade_contract_size": 100.0,
+            "volume_step": 0.1, "volume_min": 0.1,
+        }}
+    })
+    c = MT5AccountClient(bridge_call=bridge)
+    si = c.symbol_info("US100.cash")
+    assert si.tick_size == 0.01
+    assert si.tick_value == 0.5
+    assert si.contract_size == 100.0

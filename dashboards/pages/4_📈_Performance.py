@@ -86,79 +86,120 @@ def _load_trades(db_path: str) -> pd.DataFrame:
 
 
 def render_filters(df: pd.DataFrame, runs: pd.DataFrame) -> pd.DataFrame:
-    """Render sidebar filters. The DEFAULT now scopes to the most-recent
-    single run, not every backtest ever — otherwise the page conflates
-    apples and oranges (different starting balances, different lot
-    sizes, different strategies)."""
-    st.sidebar.markdown("### 🔎  Filters")
+    """Render filters in a top-of-page expander (Phase-32: moved from
+    sidebar to main content for consistency with Backtest / Composer /
+    Compare / Replay Parity). Sidebar reserved for navigation only.
+
+    Default scopes to the most-recent single run — the trade journal
+    accumulates every backtest, so summing all of them mixes apples
+    and oranges (different starting balances, lot sizes, strategies).
+    """
     if df.empty:
         return df
 
-    # ── Run picker (the big change) ──
-    st.sidebar.markdown("**Scope**")
-    scope_options = ["Single run (most recent)", "Compare runs",
-                      "All trades (raw journal)"]
-    scope = st.sidebar.radio("scope", scope_options, index=0,
-                              key="perf_scope",
-                              label_visibility="collapsed")
+    with st.expander("🔎  Filters (scope + attributes)", expanded=False):
+        # ── Run scope picker ──
+        st.markdown("**Scope**")
+        scope_options = ["Single run (most recent)", "Compare runs",
+                          "All trades (raw journal)"]
+        scope = st.radio("scope", scope_options, index=0,
+                          key="perf_scope",
+                          label_visibility="collapsed",
+                          horizontal=True)
 
-    f = df.copy()
-    if scope == "Single run (most recent)":
-        if not runs.empty:
-            run_labels = {r["run_id"]: _run_label(r)
-                           for _, r in runs.iterrows()}
-            chosen = st.sidebar.selectbox(
-                "run", options=list(run_labels.keys()),
-                format_func=lambda rid: run_labels[rid],
-                index=0, key="perf_single_run",
+        f = df.copy()
+        if scope == "Single run (most recent)":
+            if not runs.empty:
+                run_labels = {r["run_id"]: _run_label(r)
+                               for _, r in runs.iterrows()}
+                chosen = st.selectbox(
+                    "run", options=list(run_labels.keys()),
+                    format_func=lambda rid: run_labels[rid],
+                    index=0, key="perf_single_run",
+                )
+                f = f[f["run_id"] == chosen]
+        elif scope == "Compare runs":
+            if not runs.empty:
+                run_labels = {r["run_id"]: _run_label(r)
+                               for _, r in runs.iterrows()}
+                chosen = st.multiselect(
+                    "runs", options=list(run_labels.keys()),
+                    format_func=lambda rid: run_labels[rid],
+                    default=list(run_labels.keys())[:3],
+                    key="perf_multi_run",
+                )
+                if chosen:
+                    f = f[f["run_id"].isin(chosen)]
+        # else: scope == "All trades" → no run filter
+
+        # Attribute filters in 4-column grid
+        st.markdown("**Attributes**")
+        attr_cols = st.columns(4)
+        with attr_cols[0]:
+            modes = sorted(f["mode"].dropna().unique().tolist())
+            sel_modes = st.multiselect(
+                "mode", modes, default=modes, key="perf_modes",
             )
-            f = f[f["run_id"] == chosen]
-    elif scope == "Compare runs":
-        if not runs.empty:
-            run_labels = {r["run_id"]: _run_label(r)
-                           for _, r in runs.iterrows()}
-            chosen = st.sidebar.multiselect(
-                "runs", options=list(run_labels.keys()),
-                format_func=lambda rid: run_labels[rid],
-                default=list(run_labels.keys())[:3],
-                key="perf_multi_run",
+        with attr_cols[1]:
+            strats = sorted(f["strategy"].dropna().unique().tolist())
+            sel_strats = st.multiselect(
+                "strategy", strats, default=strats, key="perf_strats",
             )
-            if chosen:
-                f = f[f["run_id"].isin(chosen)]
-    # else: scope == "All trades" → no run filter
+        with attr_cols[2]:
+            syms = sorted(f["symbol"].dropna().unique().tolist())
+            sel_syms = st.multiselect(
+                "symbol", syms, default=syms, key="perf_syms",
+            )
+        with attr_cols[3]:
+            reasons = sorted(f["close_reason"].dropna().unique().tolist())
+            sel_reasons = st.multiselect(
+                "close_reason", reasons, default=reasons,
+                key="perf_reasons",
+            )
+        if sel_modes:
+            f = f[f["mode"].isin(sel_modes)]
+        if sel_strats:
+            f = f[f["strategy"].isin(sel_strats)]
+        if sel_syms:
+            f = f[f["symbol"].isin(sel_syms)]
+        if sel_reasons:
+            f = f[f["close_reason"].isin(sel_reasons)]
 
-    # Secondary attribute filters (within whatever runs we kept)
-    st.sidebar.markdown("**Attributes**")
-    modes = sorted(f["mode"].dropna().unique().tolist())
-    sel_modes = st.sidebar.multiselect("mode", modes, default=modes,
-                                          key="perf_modes")
-    strats = sorted(f["strategy"].dropna().unique().tolist())
-    sel_strats = st.sidebar.multiselect("strategy", strats, default=strats,
-                                           key="perf_strats")
-    syms = sorted(f["symbol"].dropna().unique().tolist())
-    sel_syms = st.sidebar.multiselect("symbol", syms, default=syms,
-                                         key="perf_syms")
-    reasons = sorted(f["close_reason"].dropna().unique().tolist())
-    sel_reasons = st.sidebar.multiselect("close_reason", reasons,
-                                            default=reasons, key="perf_reasons")
-    if sel_modes:
-        f = f[f["mode"].isin(sel_modes)]
-    if sel_strats:
-        f = f[f["strategy"].isin(sel_strats)]
-    if sel_syms:
-        f = f[f["symbol"].isin(sel_syms)]
-    if sel_reasons:
-        f = f[f["close_reason"].isin(sel_reasons)]
-
-    # Persist scope label for the explainer line
-    st.session_state["_perf_scope_label"] = scope
+        # Persist scope label for the explainer line
+        st.session_state["_perf_scope_label"] = scope
     return f.reset_index(drop=True)
+
+
+def _basis_caption(df: pd.DataFrame) -> str:
+    """Build a one-line caption describing what mix of trades this
+    metric block is computed from. Pre-fix every tile said its number
+    without explaining whether it was live, paper, or backtest data —
+    user couldn't tell what the basis was."""
+    if df.empty:
+        return "(no trades match filters)"
+    by_mode = df["mode"].value_counts()
+    parts = []
+    for m in ("live", "paper", "backtest"):
+        n = int(by_mode.get(m, 0))
+        if n > 0:
+            parts.append(f"{n} {m}")
+    return "Computed from: " + " · ".join(parts) + (
+        f" trades over " +
+        f"{df['closed_at_utc'].min().strftime('%Y-%m-%d')} → "
+        f"{df['closed_at_utc'].max().strftime('%Y-%m-%d')}"
+        if pd.notna(df['closed_at_utc']).any() else ""
+    )
 
 
 def render_metrics(df: pd.DataFrame):
     n = len(df)
     if n == 0:
-        st.info("No trades match these filters.")
+        st.info(
+            "No trades match these filters. Default scope is the most "
+            "recent run — try widening the date range or changing the "
+            "mode filter above. If you have NO live/paper trades yet, "
+            "scroll to **🔮 Expected stats** below for catalog projections."
+        )
         return
     pnl = float(df["pnl"].sum())
     wins = (df["pnl"] > 0).sum()
@@ -167,55 +208,128 @@ def render_metrics(df: pd.DataFrame):
     gl = -df.loc[df["pnl"] <= 0, "pnl"].sum()
     pf = gw / gl if gl > 0 else float("inf") if gw > 0 else 0
     avg_R = df["R"].mean()
+    # ── Source-labeled metrics (Phase-32) ─────────────────────────────
+    # User's complaint: "performance page chart still i can not
+    # understand what data it show". Fix: every tile now has a basis
+    # caption so it's never ambiguous what produced the number.
+    st.markdown("### 📊  Realized P&L metrics")
+    st.caption(_basis_caption(df))
     cols = st.columns(5)
-    cols[0].metric("trades", n)
-    cols[1].metric("win rate", f"{win_rate:.1f}%")
+    cols[0].metric(
+        "Trades", n,
+        help="Total closed trades in the filtered set. "
+              "Excludes open positions (those have unrealized P&L only).",
+    )
+    cols[1].metric(
+        "Win rate", f"{win_rate:.1f}%",
+        help="(wins / total) × 100. A coin flip is 50%. RSI mean-rev "
+              "typically 55-65%; trend-following 35-45% with R:R > 1.",
+    )
     pf_text = "inf" if pf == float("inf") else f"{pf:.2f}"
-    cols[2].metric("profit factor", pf_text)
-    cols[3].metric("avg R", f"{avg_R:+.3f}")
-    cols[4].metric("net P&L", f"${pnl:+,.2f}")
+    cols[2].metric(
+        "Profit factor", pf_text,
+        help="Gross wins ÷ gross losses. >1.0 profitable, >1.5 strong, "
+              "<1.0 losing. Be skeptical of PF >5 on <30 trades — "
+              "small sample noise.",
+    )
+    cols[3].metric(
+        "Avg R", f"{avg_R:+.3f}",
+        help="Mean R-multiple per trade. R = (exit − entry) / "
+              "(entry − stop). +0.20R per trade is a real edge; "
+              "+0.50R is excellent.",
+    )
+    cols[4].metric(
+        "Net P&L (realized)", f"${pnl:+,.2f}",
+        help="Sum of realized_pnl across all trades in the filtered set. "
+              "Positive = winning overall.",
+    )
 
 
-def render_equity(df: pd.DataFrame):
+def render_equity(df: pd.DataFrame, key_suffix: str = ""):
     if df.empty:
         return
     df_s = df.sort_values("closed_at_utc").copy()
     df_s["cum_pnl"] = df_s["pnl"].cumsum()
+    st.markdown("### 📈  Cumulative P&L curve")
+    st.caption(
+        "Each point on the green line = closed trade. y-axis is total "
+        "$ profit since the first trade in the filtered set. Going up "
+        "and to the right = winning. Flat or down = losing. "
+        "**Hover** any point to see the exact trade. " +
+        _basis_caption(df)
+    )
     fig = go.Figure(go.Scatter(
         x=df_s["closed_at_utc"], y=df_s["cum_pnl"],
-        mode="lines", line=dict(color="#0a4", width=1.5),
+        mode="lines+markers", line=dict(color="#0a4", width=1.5),
+        marker=dict(size=4),
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "cum P&L: $%{y:,.2f}<extra></extra>"
+        ),
     ))
-    fig.update_layout(title="Cumulative P&L (filtered)",
-                       xaxis_title="time", yaxis_title="$",
-                       height=320, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        xaxis_title="trade close time", yaxis_title="$ cumulative",
+        height=320, margin=dict(l=10, r=10, t=30, b=10),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, width="stretch",
+                    key=f"perf_equity_{key_suffix}")
     # Drawdown
     peak = df_s["cum_pnl"].cummax()
     dd = df_s["cum_pnl"] - peak
+    max_dd = float(dd.min()) if len(dd) > 0 else 0.0
+    st.markdown("### 📉  Drawdown curve")
+    st.caption(
+        f"Distance below the running peak — i.e. how much you were "
+        f"underwater at any moment. **Worst drawdown in this set: "
+        f"${max_dd:,.0f}**. The closer the red line stays to zero, "
+        f"the smoother the equity curve. Long flat-at-zero stretches "
+        f"= no drawdown (we're at the all-time high)."
+    )
     fig2 = go.Figure(go.Scatter(
         x=df_s["closed_at_utc"], y=dd, mode="lines",
         line=dict(color="#c33", width=0.8), fill="tozeroy",
         fillcolor="rgba(204,51,51,0.25)",
+        hovertemplate=(
+            "<b>%{x|%Y-%m-%d %H:%M}</b><br>"
+            "drawdown: $%{y:,.2f}<extra></extra>"
+        ),
     ))
-    fig2.update_layout(title="Drawdown ($)",
-                        xaxis_title="time", yaxis_title="$",
-                        height=180, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig2, use_container_width=True)
+    fig2.update_layout(
+        xaxis_title="trade close time", yaxis_title="$ underwater",
+        height=180, margin=dict(l=10, r=10, t=30, b=10),
+    )
+    st.plotly_chart(fig2, width="stretch",
+                    key=f"perf_drawdown_{key_suffix}")
 
 
-def render_r_distribution(df: pd.DataFrame):
+def render_r_distribution(df: pd.DataFrame, key_suffix: str = ""):
     if df.empty:
         return
+    st.markdown("**🎯 R-multiple distribution**")
+    st.caption(
+        "How each trade ended in **R-multiples** — units of risk. "
+        "1R win = exit price hit the take-profit (= 1× the planned "
+        "stop distance). −1R = stop hit. Trades cluster near +1R / −1R "
+        "for fixed-target strategies; spread out for trend-followers. "
+        "**Right of zero = winning trades**, left = losing. A healthy "
+        "edge has a fat right tail or sparse big-loss left tail."
+    )
     fig = go.Figure(go.Histogram(
         x=df["R"], nbinsx=40, marker_color="#3a8ac4",
+        hovertemplate="R bin: %{x}<br>trades: %{y}<extra></extra>",
     ))
-    fig.update_layout(title="R-multiple distribution",
-                       xaxis_title="R", yaxis_title="trades",
-                       height=300, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.add_vline(x=0, line=dict(color="#888", width=1, dash="dot"))
+    fig.update_layout(
+        xaxis_title="R-multiple per trade",
+        yaxis_title="number of trades",
+        height=300, margin=dict(l=10, r=10, t=10, b=10),
+    )
+    st.plotly_chart(fig, width="stretch",
+                    key=f"perf_rdist_{key_suffix}")
 
 
-def render_monthly_heatmap(df: pd.DataFrame):
+def render_monthly_heatmap(df: pd.DataFrame, key_suffix: str = ""):
     if df.empty or df["closed_at_utc"].isna().all():
         return
     df = df.copy()
@@ -225,35 +339,61 @@ def render_monthly_heatmap(df: pd.DataFrame):
     pivot = monthly.pivot(index="year", columns="month", values="pnl")
     if pivot.empty:
         return
+    st.markdown("### 🗓️  Monthly P&L heatmap (year × month)")
+    st.caption(
+        "Each cell = sum of realized P&L for that calendar month. "
+        "Green = profitable month, red = losing. Empty cells = no "
+        "trades. Useful for spotting **regime breaks**: if the last "
+        "3 months turn red while earlier months were green, the "
+        "strategy may have decayed and need re-eval."
+    )
     fig = go.Figure(go.Heatmap(
         z=pivot.values, x=pivot.columns, y=pivot.index,
         colorscale="RdYlGn", zmid=0,
         text=[[f"${v:+,.0f}" if pd.notna(v) else "" for v in row]
                for row in pivot.values],
         texttemplate="%{text}", textfont=dict(size=10),
-        colorbar=dict(title="$"),
+        colorbar=dict(title="$ P&L"),
+        hovertemplate="<b>%{y}-%{x}</b><br>$%{z:+,.0f}<extra></extra>",
     ))
-    fig.update_layout(title="Monthly P&L heatmap (year × month)",
-                       xaxis_title="month", yaxis_title="year",
-                       height=320, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        xaxis_title="month (1=Jan, 12=Dec)", yaxis_title="year",
+        height=320, margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(tickmode="linear", tick0=1, dtick=1),
+    )
+    st.plotly_chart(fig, width="stretch",
+                    key=f"perf_heatmap_{key_suffix}")
 
 
-def render_attribution_pie(df: pd.DataFrame):
+def render_attribution_pie(df: pd.DataFrame, key_suffix: str = ""):
     if df.empty:
         return
+    st.markdown("**🥧 P&L attribution by strategy**")
+    st.caption(
+        "How much of the total profit came from each strategy. Useful "
+        "when you have multiple cells live: tells you which is "
+        "actually carrying the account vs which is dead weight. A "
+        "single dominant slice + 4 tiny slivers = you're really "
+        "running 1 strategy plus noise."
+    )
     by_strat = df.groupby("strategy")["pnl"].sum().sort_values(ascending=False)
     fig = go.Figure(go.Pie(
         labels=by_strat.index.tolist(),
         values=by_strat.values.tolist(),
         hole=0.45,
+        hovertemplate="<b>%{label}</b><br>$%{value:,.0f}<br>"
+                       "%{percent}<extra></extra>",
     ))
-    fig.update_layout(title="P&L attribution by strategy",
-                       height=320, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, use_container_width=True)
+    fig.update_layout(
+        height=320, margin=dict(l=10, r=10, t=10, b=10),
+        showlegend=True,
+    )
+    st.plotly_chart(fig, width="stretch",
+                    key=f"perf_attr_{key_suffix}")
 
 
-def render_journal_table(df: pd.DataFrame, db_path: str):
+def render_journal_table(df: pd.DataFrame, db_path: str,
+                          key_suffix: str = ""):
     if df.empty:
         return
     st.markdown("---")
@@ -262,11 +402,11 @@ def render_journal_table(df: pd.DataFrame, db_path: str):
         df[["closed_at_utc", "mode", "strategy", "symbol", "tf",
             "direction", "entry", "exit", "lots", "pnl", "R",
             "close_reason", "note", "run_id", "trade_idx"]],
-        use_container_width=True, height=480,
+        width="stretch", height=480,
         disabled=["closed_at_utc", "mode", "strategy", "symbol", "tf",
                   "direction", "entry", "exit", "lots", "pnl", "R",
                   "close_reason", "run_id", "trade_idx"],
-        key="perf_journal_editor",
+        key=f"perf_journal_editor_{key_suffix}",
     )
     # Persist any note changes
     changed = (edited["note"].fillna("") != df["note"].fillna(""))
@@ -314,25 +454,41 @@ def render_basis_explainer(df: pd.DataFrame,
 
 def render_recent_runs(runs: pd.DataFrame) -> None:
     """A compact list of the 10 most recent runs at the top of the page,
-    so the operator can see what's in the journal at a glance."""
+    so the operator can see what's in the journal at a glance.
+
+    Uses explicit pd.notna checks because run rows can have NaN for
+    n_trades / sum_realized_pnl when a run was started but never finished
+    (storage.save_run inserts the row before storage.finish_run fills
+    those columns)."""
     if runs is None or runs.empty:
         return
+
+    def _safe_int(v) -> int:
+        return int(v) if pd.notna(v) else 0
+
+    def _safe_float(v) -> float:
+        return float(v) if pd.notna(v) else 0.0
+
+    def _safe_bool(v) -> bool:
+        # SQLite stores reconciles as 0/1, NaN if NULL → treat NaN as False
+        return bool(v) if pd.notna(v) else False
+
     with st.expander(f"📚  Recent runs in journal ({len(runs)})",
                        expanded=False):
         rows = []
         for _, r in runs.head(20).iterrows():
             rows.append({
-                "started": str(r["started_at_utc"])[:16],
-                "strategy": r["strategy"],
-                "symbol": r["symbol"],
-                "tf": r["tf"],
-                "trades": int(r["n_trades"] or 0),
-                "$ pnl": round(float(r["sum_realized_pnl"] or 0.0), 2),
-                "start_bal": round(float(r["starting_balance"] or 0.0)),
-                "reconciles": "✓" if r["reconciles"] else "⛔",
-                "run_id": r["run_id"],
+                "started": str(r.get("started_at_utc") or "")[:16],
+                "strategy": r.get("strategy") or "—",
+                "symbol": r.get("symbol") or "—",
+                "tf": r.get("tf") or "—",
+                "trades": _safe_int(r.get("n_trades")),
+                "$ pnl": round(_safe_float(r.get("sum_realized_pnl")), 2),
+                "start_bal": round(_safe_float(r.get("starting_balance"))),
+                "reconciles": "✓" if _safe_bool(r.get("reconciles")) else "⛔",
+                "run_id": r.get("run_id"),
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True,
+        st.dataframe(pd.DataFrame(rows), width="stretch",
                        height=min(420, 36 * (len(rows) + 1)))
 
 
@@ -374,7 +530,7 @@ def render_projected_from_library() -> None:
         "60% of bars, evaluated on the last 40%. Win rate is a rough "
         "proxy from R; verify per strategy on the Strategy Library "
         "scatter plot.")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+    st.dataframe(pd.DataFrame(rows), width="stretch",
                    height=min(360, 36 * (len(rows) + 1)))
 
 
@@ -389,7 +545,18 @@ def main():
         "(the trade journal accumulates every backtest, so summing them "
         "all together would add apples to oranges)."
     )
-    db_path = str(REPO / "data" / "v2.db")
+    # Bug D fix (2026-05-08): resolve per-account DB instead of legacy
+    # main repo DB so Performance reads from the same place the runner
+    # writes trades. Falls back to main DB only when no account is set.
+    try:
+        from core import account_manager
+        accounts = account_manager.list_accounts()
+        if accounts:
+            db_path = str(account_manager.get_db_path(accounts[0].login))
+        else:
+            db_path = str(REPO / "data" / "v2.db")
+    except Exception:
+        db_path = str(REPO / "data" / "v2.db")
     runs = _load_runs(db_path)
     df_all = _load_trades(db_path)
 
@@ -404,15 +571,68 @@ def main():
     df = render_filters(df_all, runs)
     render_basis_explainer(df, runs)
 
-    render_metrics(df)
-    render_equity(df)
-    cols = st.columns(2)
-    with cols[0]:
-        render_r_distribution(df)
-    with cols[1]:
-        render_attribution_pie(df)
-    render_monthly_heatmap(df)
-    render_journal_table(df, db_path)
+    # ── Phase-32: separate paper / live / backtest into tabs ──────────
+    # User asked: "should we separate paper and live and backtest
+    # rather mixing them up". Mixing was correct for the OLD basis
+    # caption (one combined table) but masked which trades came from
+    # which mode. Now: 4 tabs — All / Live / Paper / Backtest — each
+    # with its own metrics + charts + journal. Default tab is the
+    # most relevant (live if any live trades; else paper; else all).
+    n_live = int((df["mode"] == "live").sum())
+    n_paper = int((df["mode"] == "paper").sum())
+    n_bt = int((df["mode"] == "backtest").sum())
+    tab_labels = [
+        f"📊 All ({len(df)})",
+        f"🟢 Live ({n_live})",
+        f"🟡 Paper ({n_paper})",
+        f"🧪 Backtest ({n_bt})",
+    ]
+    tab_all, tab_live, tab_paper, tab_bt = st.tabs(tab_labels)
+
+    def _render_tab(df_tab: pd.DataFrame, label: str) -> None:
+        if df_tab.empty:
+            st.info(
+                f"No {label} trades match these filters. "
+                f"Switch to another tab or widen the date range."
+            )
+            return
+        render_metrics(df_tab)
+        render_equity(df_tab, key_suffix=label)
+        sub_cols = st.columns(2)
+        with sub_cols[0]:
+            render_r_distribution(df_tab, key_suffix=label)
+        with sub_cols[1]:
+            render_attribution_pie(df_tab, key_suffix=label)
+        render_monthly_heatmap(df_tab, key_suffix=label)
+        render_journal_table(df_tab, db_path, key_suffix=label)
+
+    with tab_all:
+        st.caption(
+            "Combined view across all modes. Useful for total system "
+            "performance — but check the per-mode tabs to confirm "
+            "which mode is actually contributing."
+        )
+        _render_tab(df, "all")
+    with tab_live:
+        st.caption(
+            "🟢 **Live trades only** — real money committed via the broker. "
+            "This is the truth signal for whether your system is working "
+            "in production. Compare to the Catalog projection to verify "
+            "live matches backtest."
+        )
+        _render_tab(df[df["mode"] == "live"], "live")
+    with tab_paper:
+        st.caption(
+            "🟡 **Paper trades only** — same strategy + same data as live "
+            "but executed against the paper executor (no broker)."
+        )
+        _render_tab(df[df["mode"] == "paper"], "paper")
+    with tab_bt:
+        st.caption(
+            "🧪 **Backtest trades only** — historical replay. The Catalog "
+            "and Strategy Library numbers are derived from these."
+        )
+        _render_tab(df[df["mode"] == "backtest"], "backtest")
 
 
 main()

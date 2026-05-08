@@ -45,6 +45,18 @@ WISHLIST_CELLS: list[tuple[str, str]] = [
     ("US500.cash", "D1"),
     ("GER40.cash", "D1"),
     ("EU50.cash",  "D1"),
+    # Phase 2 stocks (US single-names) + FX cross pairs.
+    # Each fetched at all 3 TFs (M15, H1, D1) so the optimizer can sweep
+    # them automatically.
+    *[(sym, tf) for sym in
+      ("AMD", "AMZN", "AVGO", "CSCO", "INTC", "MSFT", "NVDA",
+       "EURGBP", "EURJPY", "USDCNH", "USDSEK")
+      for tf in ("M15", "H1", "D1")],
+    # Crypto — added 2026-05-05 after user confirmed BTCUSD is live in
+    # FTMO Market Watch (bid 80078.20 / ask 80079.20). H4 included
+    # because crypto trades 24/7 — H4 is a popular crypto cell whereas
+    # FX/index H4 was deemed redundant against H1 + D1.
+    *[("BTCUSD", tf) for tf in ("M15", "H1", "H4", "D1")],
 ]
 
 

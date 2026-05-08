@@ -111,6 +111,100 @@ def test_total_trades():
     assert s.total_trades == 28
 
 
+def test_evaluate_hard_gates_passing_cell():
+    """A clean cell — overall PF 1.4, TEST PF 1.3, TEST R +0.2,
+    recovery 30d, n_test 50 — passes all gates. Empty tuple."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.4, test_pf=1.3, test_r=0.2,
+        recovery_days=30.0, n_test=50,
+    )
+    assert reasons == ()
+
+
+def test_evaluate_hard_gates_rejects_never_recovered():
+    """recovery_days=None means cell is currently underwater — must fail."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.4, test_pf=1.3, test_r=0.2,
+        recovery_days=None, n_test=50,
+    )
+    assert any("not yet" in r.lower() or "underwater" in r.lower()
+               for r in reasons)
+
+
+def test_evaluate_hard_gates_rejects_negative_test():
+    """TEST PF < 1.0 + negative TEST avg_R = OOS failure → reject."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.05, test_pf=0.95, test_r=-0.01,
+        recovery_days=30.0, n_test=50,
+    )
+    # Both test_pf and test_r failures should be flagged
+    assert any("TEST partition PF" in r for r in reasons)
+    assert any("TEST avg_R" in r for r in reasons)
+
+
+def test_evaluate_hard_gates_rejects_marginal_overall_pf():
+    """Overall PF 1.02 — barely break-even — fails the 1.05 gate."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.02, test_pf=1.10, test_r=0.05,
+        recovery_days=20.0, n_test=50,
+    )
+    assert any("overall PF" in r for r in reasons)
+
+
+def test_evaluate_hard_gates_rejects_slow_recovery():
+    """recovery_days > max_recovery_days → reject."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.4, test_pf=1.3, test_r=0.2,
+        recovery_days=120.0, n_test=50,
+    )
+    assert any("Recovery 120d" in r for r in reasons)
+
+
+def test_evaluate_hard_gates_rejects_tiny_oos_sample():
+    """n_test below threshold → reject (statistical noise)."""
+    reasons = edge_catalog._evaluate_hard_gates(
+        overall_pf=1.4, test_pf=1.3, test_r=0.2,
+        recovery_days=30.0, n_test=5,
+    )
+    assert any("OOS sample" in r for r in reasons)
+
+
+def test_edge_stat_deploy_safe_property():
+    """deploy_safe = empty hard_gate_failed tuple."""
+    safe = EdgeStat(ticker="X", tf="D1", strategy="s",
+                     n_train=10, train_pf=1.5, train_r=0.2,
+                     n_test=10, test_pf=1.8, test_r=0.3,
+                     hard_gate_failed=())
+    assert safe.deploy_safe is True
+    bad = EdgeStat(ticker="X", tf="D1", strategy="s",
+                     n_train=10, train_pf=1.5, train_r=0.2,
+                     n_test=10, test_pf=1.8, test_r=0.3,
+                     hard_gate_failed=("TEST PF too low",))
+    assert bad.deploy_safe is False
+
+
+def test_md_table_loader_caps_score_for_failing_cell(tmp_path):
+    """A markdown row with a 'never recovered' (—) recovery should get
+    its score capped and hard_gate_failed populated."""
+    f = tmp_path / "opt.md"
+    f.write_text("""\
+| rank | strategy | ticker | tf | side | R:R | n | PF | R | win% | netPnL$ | maxDD% | maxDD$ | DDdays | recovD | streak | rr | avgWin$ | avgLoss$ | CAGR | P(pass) | sus | score |
+|---:|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| 1 | donchian_20 | JP225.cash | M15 | long | 1:2 | 482 | 1.02 | +0.016 | 38.2 | +1823 | 6.6 | -6512 | 18 | — | 13 | 1.65 | +484 | -293 | +6.1 | 75% | ✅ | 31.0 |
+""")
+    cat = edge_catalog.load_catalog(f)
+    rows = cat[("JP225.cash", "M15")]
+    assert len(rows) == 1
+    r = rows[0]
+    # Score must be capped — 31 → ≤15
+    assert r.score <= 15.0
+    # And hard_gate_failed must explain why
+    assert r.hard_gate_failed
+    assert any("not yet" in reason.lower() or "underwater" in reason.lower()
+               for reason in r.hard_gate_failed)
+    assert r.deploy_safe is False
+
+
 def test_load_catalog_survives_malformed_rows(tmp_path):
     f = tmp_path / "malformed.md"
     f.write_text("""\

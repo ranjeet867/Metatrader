@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from core.indicators import atr_wilder, rolling_high, rolling_low
+from core.indicators import atr_wilder, ema, rolling_high, rolling_low
 from core.strategy import Signal
 
 
@@ -24,6 +24,12 @@ class DonchianBreakoutParams:
     stop_atr_mult: float = 1.5
     target_atr_mult: float = 3.0   # → 2R reward when stop_atr_mult=1.5
     long_only: bool = False
+    # Higher-timeframe regime filter. 0 = off (legacy). When >0, LONG
+    # signals only fire when close > EMA(regime_ema_period); SHORT only
+    # when close < EMA(regime_ema_period). Empirically the 200-EMA
+    # filter improved donch55 XAUUSD H1 from PF 1.45 to 1.65 in the
+    # 2026-05 sweep — 4 of 12 cells benefited.
+    regime_ema_period: int = 0
 
 
 class DonchianBreakout:
@@ -41,6 +47,8 @@ class DonchianBreakout:
         prior_hi = rolling_high(candles["close"], p.period).shift(1)
         prior_lo = rolling_low(candles["close"], p.period).shift(1)
         atr = atr_wilder(candles, p.atr_period)
+        regime_ema = (ema(candles["close"], p.regime_ema_period).values
+                       if p.regime_ema_period > 0 else None)
 
         out: list[Signal] = []
         c = candles["close"].values
@@ -55,8 +63,15 @@ class DonchianBreakout:
             a = atr_v[i]
             if a <= 0 or pd.isna(ph[i]) or pd.isna(pl[i]):
                 continue
+            # Regime gate
+            if regime_ema is not None:
+                regime_val = regime_ema[i]
+                if pd.isna(regime_val):
+                    continue
             # Cross above: prior bar at-or-below prior high, current bar above
             if c[i] > ph[i] and c[i - 1] <= (ph[i - 1] if not pd.isna(ph[i - 1]) else c[i] + 1):
+                if regime_ema is not None and c[i] <= regime_val:
+                    continue
                 stop = c[i] - p.stop_atr_mult * a
                 target = c[i] + p.target_atr_mult * a
                 if stop > 0:
@@ -71,6 +86,8 @@ class DonchianBreakout:
                 continue
             # Cross below
             if c[i] < pl[i] and c[i - 1] >= (pl[i - 1] if not pd.isna(pl[i - 1]) else c[i] - 1):
+                if regime_ema is not None and c[i] >= regime_val:
+                    continue
                 stop = c[i] + p.stop_atr_mult * a
                 target = c[i] - p.target_atr_mult * a
                 if target > 0:

@@ -30,9 +30,43 @@ class Deployment:
     params: dict = field(default_factory=dict)
     risk_pct: float = 0.3
     daily_cap_pct: float = 1.0
+    # FTMO-style accounts cap absolute lot size much lower than the symbol's
+    # broker-side volume_max (e.g. 15 lots regardless of margin headroom).
+    # When set, the position sizer clamps the computed lots DOWN to this
+    # value before the order is sent — preventing 'invalid volume' rejects.
+    # 0 / None means "no per-deployment cap" (still bounded by volume_max).
+    max_lots: float = 15.0
+    # HARD $-ceiling per trade. Default 0 = "no cap, trust risk_pct alone".
+    # Composer auto-fills this at deploy time = (equity × daily_cap_pct/100)
+    # / expected_trades_per_day. The runner clamps actual_money_risk to this
+    # so a tight-stop signal can NEVER size up beyond what's safe — the
+    # main defense against gold-style blow-ups (1 wrong lot = 5% in ticks).
+    max_money_risk_usd: float = 0.0
     status: DeploymentStatus = "idle"
     last_started_at_utc: str | None = None
+    # DEPRECATED for new code — kept for backwards compat with old
+    # deployments.json. Equivalent to last_signal_seen_at_utc.
     last_signal_at_utc: str | None = None
+    # Bar-time of the last bar the runner evaluated this deployment on
+    # (whether or not a signal fired). Pre-fix this stayed null during
+    # live ticks, making a healthy idle deployment look indistinguishable
+    # from a dead one. Now the runner writes it after every successful
+    # tick that processed a NEW bar (i.e. wasn't deduped). UI shows
+    # "evaluated 1m ago" → user knows the runner is alive even when no
+    # signal has fired.
+    last_evaluated_at_utc: str | None = None
+    # Bar-time when the strategy DETECTED a signal — regardless of
+    # whether the open succeeded. A signal can be detected but blocked
+    # by position_guard / sizing-rejected / circuit-breaker / parity
+    # gate. Pre-fix the user couldn't distinguish "strategy fired but
+    # was refused" from "strategy never fired". Now the dashboard can
+    # show two timestamps and explain WHY a signal didn't open.
+    last_signal_seen_at_utc: str | None = None
+    # When a broker open ACTUALLY succeeded — verified by positions_get.
+    # This is the "real money was committed" timestamp. If
+    # last_signal_seen_at_utc > last_open_succeeded_at_utc, the last
+    # signal was blocked or the open is in flight.
+    last_open_succeeded_at_utc: str | None = None
     paper_run_id: str | None = None
     live_run_id: str | None = None
     notes: str = ""
@@ -51,7 +85,11 @@ def load_deployments(login: int) -> list[Deployment]:
     rows = json.loads(path.read_text())
     if not isinstance(rows, list):
         raise ValueError(f"{path}: expected a JSON array")
-    return [Deployment(**r) for r in rows]
+    # Drop unknown keys to stay forward-compat with future fields, and to
+    # tolerate older JSON files written before new fields existed.
+    known_fields = set(Deployment.__dataclass_fields__.keys())
+    return [Deployment(**{k: v for k, v in r.items() if k in known_fields})
+              for r in rows]
 
 
 def save_deployments(login: int, deployments: list[Deployment]) -> None:

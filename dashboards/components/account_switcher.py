@@ -86,7 +86,7 @@ def _render_auto_detect(target) -> None:
     """The auto-detect block at the top of the expander."""
     cols = target.columns([2, 5])
     if cols[0].button("🔍  Auto-detect from MT5",
-                       use_container_width=True,
+                       width="stretch",
                        help="Probe the running bridge for the connected "
                             "account. Skips the login lookup entirely."):
         # Lazy bridge import — not needed until clicked

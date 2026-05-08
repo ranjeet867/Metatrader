@@ -88,6 +88,11 @@ def test_static_fallback_when_catalog_missing(monkeypatch, tmp_path):
     (not vol_breakout) so the cards have stats they can actually reference."""
     monkeypatch.setattr(edge_catalog, "DEFAULT_GRID_PATH",
                           tmp_path / "absent.md")
+    # Also isolate from the auto-discover-from-v2.db path added later —
+    # otherwise the real data/v2.db backfills the catalog and the
+    # "missing" fallback never fires.
+    monkeypatch.setattr(edge_catalog, "DEFAULT_DB_PATH",
+                          tmp_path / "absent.db")
     account_manager.add_account(login=42, alias="X")
     deps = dep_mod.seed_survivor_deployments(42)
     # Fallback is the 4-row static list

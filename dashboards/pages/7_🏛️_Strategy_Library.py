@@ -22,18 +22,288 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from core import strategy_library, edge_catalog   # noqa: E402
+from core import account_manager, cost_defaults, deployment as dep_mod   # noqa: E402
+from core.parity_gate import ParityGate   # noqa: E402
 from dashboards.components import theme   # noqa: E402
 
 
+def _add_single_to_account(entry, *, status: str,
+                              quality_override_token: str = "") -> None:
+    """Add ONE strategy from the library to the active account's
+    deployments.json. Two gates apply:
+
+      1. **Quality gate** — refuses to add a cell with no edge,
+          excessive drawdown, never-recovered DD, etc. BLOCK can ONLY
+          be bypassed when quality_override_token == "I UNDERSTAND".
+      2. **Parity gate** — Live status falls back to paper if no
+          recent replay-parity pass (variant resolved to base name).
+    """
+    from core.deployment_quality_gate import (
+        evaluate_quality, load_criteria, QualityCriteria,
+    )
+    from dashboards.components.state import discover_strategies
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+
+    try:
+        accounts = account_manager.list_accounts()
+        active = accounts[0] if accounts else None
+    except Exception:
+        active = None
+    if active is None:
+        st.error("No MT5 account configured — add one on Operations page.")
+        return
+
+    # ── Quality gate — first defence ─────────────────────────────────
+    es = entry.edge
+    if es is not None:
+        # Live = strict criteria. Paper = lenient (allows experimentation).
+        if status == "live":
+            criteria = load_criteria(active.login)
+        else:
+            criteria = QualityCriteria.lenient()
+        qres = evaluate_quality(es, criteria=criteria)
+        if qres.is_blocked:
+            if quality_override_token != "I UNDERSTAND":
+                st.error(
+                    f"⛔ **Deploy BLOCKED — failed {len(qres.block_reasons)} "
+                    f"quality check(s)** for `{entry.strategy}` × "
+                    f"`{entry.ticker}` × `{entry.tf}` ({status}):"
+                )
+                for reason in qres.block_reasons:
+                    st.markdown(f"- {reason}")
+                st.markdown(
+                    "**Override (NOT recommended):** type "
+                    "`I UNDERSTAND` in the override box on the page and "
+                    "click again. The gate exists because these specific "
+                    "issues mean the strategy is mathematically losing or "
+                    "FTMO-incompatible — overriding will most likely cost "
+                    "you the account."
+                )
+                return
+            # Override path — log it, deploy as paper regardless of status
+            st.warning(
+                f"⚠ Quality BLOCK overridden by user. "
+                f"Forcing **paper** mode for safety regardless of "
+                f"requested {status} — promote later via Paper page only "
+                f"if you've verified live conditions are OK."
+            )
+            status = "paper"
+        elif qres.verdict == "WARN":
+            for w in qres.warn_reasons:
+                st.warning(f"🟡 Quality WARN: {w}")
+
+    # ── Parity gate — second defence ────────────────────────────────
+    gate = ParityGate(REPO / "data" / "v2.db")
+    base_strat = (resolve_base_strategy(entry.strategy, discover_strategies())
+                   or entry.strategy)
+    actual = status
+    if status == "live" and not gate.is_recent(base_strat):
+        actual = "paper"
+        st.warning(
+            f"⚠ `{base_strat}` (base of variant `{entry.strategy}`) "
+            f"has no recent replay-parity pass. Falling back to "
+            f"**paper** instead of live. Click **🔬 Run replay-parity** "
+            f"on this page to unblock."
+        )
+    dep_id = (dep_mod.Deployment.slug(entry.strategy, entry.ticker, entry.tf)
+              + ("_long" if entry.long_only else "_bidir"))
+    es = entry.edge
+    risk_default = 0.30
+    cap_default = 1.0
+    notes = entry.why or ""
+    if es:
+        notes = (f"From Strategy Library — n_test {es.n_test}, "
+                  f"PF {es.test_pf:.2f}, R {es.test_r:+.2f}, "
+                  f"P(pass) {(es.p_pass_30d or 0)*100:.0f}%."
+                  + (f"  {entry.why}" if entry.why else ""))
+    d = dep_mod.Deployment(
+        deployment_id=dep_id,
+        strategy=entry.strategy,
+        ticker=entry.ticker, tf=entry.tf,
+        long_only=entry.long_only,
+        params={"long_only": entry.long_only},
+        risk_pct=risk_default, daily_cap_pct=cap_default,
+        status=actual, notes=notes,
+    )
+    dep_mod.upsert_deployment(active.login, d)
+    st.success(
+        f"✅ Added `{dep_id}` as {actual.upper()} on #{active.login}. "
+        f"Tweak risk%/cap% on the {actual.title()} page."
+    )
+    st.toast(f"deployed as {actual}")
+
+
+def _run_replay_parity_inline(entry) -> None:
+    """Run replay-parity for the selected library row inline. PASS
+    records to the gate so the Live page / deploy buttons unblock.
+    """
+    import time
+    from core.config import load_config
+    from core.data import load_parquet
+    from core.parity_check import run_parity
+    from core.symbol_info_loader import try_load as try_load_symbol_info
+    from dashboards.components.state import (
+        DEFAULT_LOTS, DEFAULT_MONEY_PER_UNIT, resolve_money_per_unit, discover_strategies,
+    )
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+
+    strategies = discover_strategies()
+    base = resolve_base_strategy(entry.strategy, strategies) or entry.strategy
+    if base not in strategies:
+        st.error(f"⛔ Base strategy `{base}` not registered.")
+        return
+    parquet = REPO / "data" / f"{entry.ticker}_{entry.tf}.parquet"
+    if not parquet.exists():
+        st.error(f"⛔ No parquet for {entry.ticker} {entry.tf} — fetch via "
+                  f"Data Manager first.")
+        return
+    StratCls, ParamsCls = strategies[base]
+    try:
+        strat = StratCls() if ParamsCls is None else StratCls(ParamsCls())
+    except Exception as e:
+        st.error(f"⛔ Could not instantiate `{base}`: {e}")
+        return
+    cfg = load_config()
+    df = load_parquet(parquet)
+    sym_info = try_load_symbol_info(entry.ticker)
+    t0 = time.time()
+    with st.spinner(f"Running replay-parity for {base}..."):
+        pr = run_parity(
+            df, strat, symbol=entry.ticker, tf=entry.tf,
+            starting_balance=100_000,
+            lots=DEFAULT_LOTS.get(entry.ticker, 0.1),
+            money_per_unit_price=resolve_money_per_unit(entry.ticker),
+            commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+            risk_cfg=cfg, symbol_info=sym_info,
+        )
+    elapsed = time.time() - t0
+    div = pr.divergence_dollars
+    cols = st.columns(4)
+    cols[0].metric("BT trades", pr.bt.n_trades)
+    cols[1].metric("Replay trades", pr.rp.n_trades)
+    cols[2].metric("BT P&L", f"${pr.bt.sum_realized_pnl:+,.2f}")
+    cols[3].metric("Divergence", f"${div:.4f}")
+    if pr.passes:
+        ParityGate(REPO / "data" / "v2.db").record_pass(
+            base, divergence_dollars=div,
+        )
+        st.success(
+            f"✅ Parity PASSED in {elapsed:.2f}s — divergence ${div:.6f}. "
+            f"`{base}` cleared for live for the next 24h. "
+            f"You can now click **🟢 Add to live** above."
+        )
+        st.toast(f"✅ {base} parity recorded")
+    else:
+        st.error(
+            f"⛔ Parity FAILED — divergence ${div:.4f} > $0.01 tolerance. "
+            f"BT: {pr.bt.n_trades} / ${pr.bt.sum_realized_pnl:+,.2f} vs "
+            f"Replay: {pr.rp.n_trades} / ${pr.rp.sum_realized_pnl:+,.2f}. "
+            f"`{base}` BLOCKED from live until engine drift is resolved."
+        )
+
+
+def _decode_legacy_variant_config(*, variant: str, rr_label: str) -> dict:
+    """Reconstruct strategy params from a legacy markdown catalog row.
+
+    Markdown rows (`docs/optimization_*.md` / `grid_results.md`) only
+    encode the variant NAME (e.g. `ema_cross_12_26`) and the R:R LABEL
+    (e.g. `1:2 wide`) — the full param dict isn't stored. To make
+    deep-dive backtests reproducible without re-running the rebaseline
+    script, decode both back to a config dict.
+
+    Mirrors:
+      - core.optimizer.RR_VARIANTS for stop/target atr-mults
+      - scripts/optimize_portfolio._build_rr_aware for variant params
+
+    Returns {} if the variant is unrecognised — caller falls through to
+    strategy defaults (which is the pre-this-fix behaviour, and visibly
+    diverges from the catalog row).
+    """
+    cfg: dict = {}
+
+    # Variant name → strategy-specific params
+    if variant.startswith("ema_cross_"):
+        parts = variant.split("_")
+        if len(parts) >= 4:
+            try:
+                cfg["fast_period"] = int(parts[2])
+                cfg["slow_period"] = int(parts[3])
+            except ValueError:
+                pass
+    elif variant.startswith("ema_pullback_"):
+        parts = variant.split("_")
+        if len(parts) >= 4:
+            try:
+                cfg["fast_period"] = int(parts[2])
+                cfg["slow_period"] = int(parts[3])
+            except ValueError:
+                pass
+    elif variant.startswith("donchian_"):
+        try:
+            cfg["period"] = int(variant.split("_")[1])
+        except (ValueError, IndexError):
+            pass
+    elif variant.startswith("rsi_"):
+        parts = variant.split("_")
+        if len(parts) >= 3:
+            try:
+                cfg["oversold"] = int(parts[1])
+                cfg["overbought"] = int(parts[2])
+            except ValueError:
+                pass
+    elif variant.startswith("bbands_"):
+        parts = variant.split("_")
+        if len(parts) >= 3:
+            try:
+                cfg["bb_period"] = int(parts[1])
+                cfg["bb_k"] = float(parts[2])
+            except ValueError:
+                pass
+
+    # R:R label → stop/target atr-mults (mirrors core.optimizer.RR_VARIANTS)
+    rr_table = {
+        "1:1":      (1.5, 1.5),
+        "1:1.5":    (1.5, 2.25),
+        "1:2":      (1.5, 3.0),
+        "1:3":      (1.5, 4.5),
+        "1:2 wide": (2.5, 5.0),
+        # 1:1.1 is donchian-specific — derived from sweep_rr_winrate
+        "1:1.1":    (1.5, 1.65),
+    }
+    if rr_label and rr_label in rr_table:
+        sm, tm = rr_table[rr_label]
+        cfg["stop_atr_mult"] = sm
+        cfg["target_atr_mult"] = tm
+
+    return cfg
+
+
 def _run_drilldown(entry, *, start_bal: float, train_pct: float,
-                    commission: float) -> None:
-    """Run the entry's backtest live and render full stats + curves."""
+                    commission: float, slippage: float = None) -> None:
+    """Run the entry's backtest live and render full stats + curves.
+
+    Pre-fix this only set `long_only` and used hard-coded
+    slippage 0.10 / commission 3.0, producing metrics that diverged
+    wildly from the catalog row (the catalog uses cost_defaults +
+    the entry's full source_config_json with stop_atr_mult /
+    target_atr_mult). E.g. ema_cross_9_20 GBPUSD D1 here showed
+    "RECOVERY 1352d" while the catalog row shows recovery ≤ 90d.
+
+    Now: pull the full config from entry.edge.source_config_json
+    when present, and use cost_defaults for slippage so the inline
+    deep-dive matches the catalog and the dedicated Backtest page.
+    """
+    import dataclasses
+    import json as _json
     from core.backtest import partition_train_test, run_backtest
     from core.backtest_stats import (
         compute_full_stats, rescale_to_starting_balance,
     )
     from core.data import load_parquet
-    from dashboards.components.state import discover_strategies
+    from core import cost_defaults as _cd
+    from dashboards.components.state import (
+        discover_strategies, resolve_money_per_unit,
+    )
 
     parquet = REPO / "data" / f"{entry.ticker}_{entry.tf}.parquet"
     if not parquet.exists():
@@ -41,34 +311,90 @@ def _run_drilldown(entry, *, start_bal: float, train_pct: float,
                   "use Data Manager to fetch.")
         return
 
+    from dashboards.components.strategy_resolver import resolve_base_strategy
+
     strats = discover_strategies()
-    base = entry.strategy
-    for needle in ("_9_20", "_12_26", "_20_50", "_30_70",
-                    "_20_2", "_55", "_20", "_10"):
-        if base.endswith(needle):
-            base = base[: -len(needle)]
-            break
-    if base not in strats:
-        st.error(f"Strategy class `{base}` not found.")
+    base = resolve_base_strategy(entry.strategy, strats)
+    if base is None:
+        st.error(
+            f"Strategy class for variant `{entry.strategy}` not found "
+            f"in registry. Registered: {sorted(strats.keys())}"
+        )
         return
     StratCls, ParamsCls = strats[base]
 
+    # Pull stored config from the catalog row when available — this is
+    # the EXACT config that produced the metrics shown in the cells
+    # table, so the deep-dive will reproduce them.
+    #
+    # Two-tier fallback:
+    #   1. v2.db rows have source_config_json populated (preferred)
+    #   2. legacy markdown rows have it empty — we infer from variant
+    #      name (e.g. ema_cross_12_26 → fast=12, slow=26) AND R:R label
+    #      (e.g. "1:2 wide" → stop=2.5, target=5.0)
+    # Without tier 2, deep-dives on legacy cells would silently use
+    # strategy defaults and produce 166 trades vs catalog's 75 — exact
+    # bug the user reported on ema_cross_12_26 × UK100.cash × H1.
+    stored_cfg: dict = {}
+    if entry.edge is not None:
+        cfg_json = getattr(entry.edge, "source_config_json", "") or ""
+        if cfg_json:
+            try:
+                stored_cfg = _json.loads(cfg_json)
+            except (ValueError, TypeError):
+                stored_cfg = {}
+        # Tier-2 fallback: decode variant name + R:R label
+        if not stored_cfg:
+            stored_cfg = _decode_legacy_variant_config(
+                variant=entry.strategy,
+                rr_label=entry.edge.rr_label,
+            )
+
+    # Symbol_info is REQUIRED for risk%-sizing to match the catalog. The
+    # rebaseline_catalog script that produced the catalog metrics uses
+    # risk_pct=0.30% and symbol_info — so the deep-dive MUST also use
+    # them, otherwise it falls back to fixed 0.1 lots and produces
+    # ~30× smaller trade sizes (avg win $10 vs catalog's $300). That
+    # turns a PF 1.54 cell into a PF 0.66 cell after fees alone.
+    from core.symbol_info_loader import try_load as _try_load_si
+    sym_info = _try_load_si(entry.ticker)
+
     with st.spinner(f"Running {entry.strategy} on {entry.ticker} {entry.tf}…"):
         df = load_parquet(parquet)
-        try:
-            strat = (StratCls(ParamsCls(long_only=entry.long_only))
-                     if ParamsCls is not None else StratCls())
-        except TypeError:
+        if ParamsCls is not None:
+            field_names = {f.name for f in dataclasses.fields(ParamsCls)}
+            kwargs = {k: v for k, v in stored_cfg.items()
+                       if k in field_names}
+            # Always honour the entry's long_only flag (overrides config)
+            if "long_only" in field_names:
+                kwargs["long_only"] = entry.long_only
+            try:
+                strat = StratCls(ParamsCls(**kwargs))
+            except TypeError:
+                strat = StratCls()
+        else:
             strat = StratCls()
         result = run_backtest(
             df, strat.signals(df),
             starting_balance=start_bal,
-            lots=1.0, money_per_unit_price=1.0,
+            lots=0.1,
+            money_per_unit_price=resolve_money_per_unit(entry.ticker),
             commission_per_trade=commission,
-            slippage_per_fill_atr_frac=0.1,
+            slippage_per_fill_atr_frac=(slippage if slippage is not None
+                                          else _cd.DEFAULT_SLIPPAGE_ATR_FRAC),
             symbol=entry.ticker,
+            risk_pct=(_cd.DEFAULT_RISK_PCT if sym_info is not None
+                       else None),
+            symbol_info=sym_info,
         )
         stats = compute_full_stats(result, starting_balance=start_bal)
+    if sym_info is None:
+        st.warning(
+            f"⚠ symbol_info missing for `{entry.ticker}` — deep-dive "
+            f"ran with fixed 0.1 lots instead of risk%-sizing. Metrics "
+            f"will diverge from the catalog row. Run "
+            f"`make refresh-symbol-info` to fix."
+        )
 
     # Reconciliation banner
     div = abs(result.sum_realized_pnl - result.equity_curve_pnl)
@@ -153,7 +479,7 @@ def _run_drilldown(entry, *, start_bal: float, train_pct: float,
             font=dict(color="#cbd5e1"),
             xaxis=dict(gridcolor="#1f2937"),
             yaxis=dict(gridcolor="#1f2937"))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         # R-distribution histogram
         rs = [t.r_multiple for t in result.trades]
@@ -169,7 +495,7 @@ def _run_drilldown(entry, *, start_bal: float, train_pct: float,
             font=dict(color="#cbd5e1"),
             xaxis=dict(gridcolor="#1f2937"),
             yaxis=dict(gridcolor="#1f2937"))
-        st.plotly_chart(fig_r, use_container_width=True)
+        st.plotly_chart(fig_r, width="stretch")
 
     # Train/Test split
     train, test = partition_train_test(result, train_pct, n_bars=len(df))
@@ -279,7 +605,107 @@ def _render_distribution_chart(
         legend=dict(orientation="h", x=0, y=1.10),
         margin=dict(l=10, r=10, t=60, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+
+
+def _render_trendo_heatmap(entries) -> None:
+    """Render every cell on the classic WR × R:R profitability matrix.
+
+    Background: green zones (EV > 0) / amber (break-even) / red (negative
+    EV). Each strategy cell is plotted as a marker — green dot if it
+    lands in the profitable zone, red if not. User can sort their entire
+    library by mathematical edge at a glance.
+    """
+    from core import trendo_matrix as tm
+
+    rows = [(e.strategy, e.ticker, e.tf, e.edge.win_rate_pct,
+             e.edge.rr_ratio, tm.expectancy_per_R(
+                 e.edge.win_rate_pct, e.edge.rr_ratio),
+             e.edge.is_trendo_profitable)
+            for e in entries
+            if e.edge is not None
+            and e.edge.win_rate_pct > 0
+            and e.edge.rr_ratio > 0]
+    if not rows:
+        return
+
+    st.markdown("### 🎯  Trendo R:R × Win-Rate matrix")
+    st.caption(
+        "Every strategy plotted on the classic profitability grid. "
+        "Green background = mathematically profitable in the long run "
+        "(EV > 0). Red = negative expectancy. Markers are coloured by "
+        "the cell's actual zone."
+    )
+
+    # Build the grid background
+    wr_grid = [10, 20, 30, 40, 50, 60, 70, 80]
+    rr_grid = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+    z_matrix = [[tm.expectancy_per_R(wr, rr) for wr in wr_grid]
+                for rr in rr_grid]
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        x=wr_grid, y=rr_grid, z=z_matrix,
+        colorscale=[[0, "#7f1d1d"], [0.5, "#7c2d12"], [0.7, "#15803d"],
+                     [1, "#16a34a"]],
+        zmid=0,
+        showscale=True, opacity=0.45,
+        colorbar=dict(title="EV per R", thickness=12),
+        hovertemplate="Win %{x}%, R:R %{y}:1<br>EV = %{z:+.2f}R<extra></extra>",
+    ))
+    # Plot every cell as a marker
+    fig.add_trace(go.Scatter(
+        x=[r[3] for r in rows], y=[r[4] for r in rows],
+        mode="markers",
+        marker=dict(
+            size=[max(8, min(22, e.edge.n_test * 0.4))
+                  for e in entries
+                  if e.edge is not None
+                  and e.edge.win_rate_pct > 0
+                  and e.edge.rr_ratio > 0],
+            color=["#16a34a" if r[6] else "#dc2626" for r in rows],
+            line=dict(width=1, color="#0f1419"),
+            opacity=0.9,
+        ),
+        text=[f"{r[0]} · {r[1]} · {r[2]}<br>"
+              f"WR {r[3]:.1f}%  R:R {r[4]:.2f}<br>"
+              f"<b>EV {r[5]:+.2f}R</b>"
+              for r in rows],
+        hovertemplate="%{text}<extra></extra>",
+        showlegend=False,
+    ))
+    # Break-even curve: WR* = 1/(1+R:R) ⟹ WR = 100/(1+R:R)
+    rr_curve = [r/10 for r in range(5, 60)]
+    wr_curve = [100.0 / (1.0 + r) for r in rr_curve]
+    fig.add_trace(go.Scatter(
+        x=wr_curve, y=rr_curve, mode="lines",
+        line=dict(color="#fbbf24", width=2, dash="dash"),
+        name="Break-even curve  (EV = 0)",
+        hovertemplate="break-even<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Win % (x) × R:R (y) — bigger marker = more OOS trades",
+        xaxis_title="Win rate %", yaxis_title="R:R ratio",
+        height=480, plot_bgcolor="#0b1117", paper_bgcolor="#0b1117",
+        font=dict(color="#cbd5e1"),
+        xaxis=dict(gridcolor="#1f2937", range=[10, 80]),
+        yaxis=dict(gridcolor="#1f2937", range=[0.5, 5.0]),
+        legend=dict(orientation="h", x=0, y=1.10),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # Summary counts
+    n_total = len(rows)
+    n_green = sum(1 for r in rows if r[6])
+    n_red = n_total - n_green
+    cols = st.columns(3)
+    cols[0].metric("Cells with edge (EV > 0)", n_green,
+                      delta=f"{n_green/n_total*100:.0f}% of total")
+    cols[1].metric("Cells losing in long run", n_red,
+                      delta=f"{n_red/n_total*100:.0f}% of total",
+                      delta_color="inverse")
+    cols[2].metric("Mean EV per R",
+                      f"{sum(r[5] for r in rows)/n_total:+.2f}R")
 
 
 def main() -> None:
@@ -292,6 +718,12 @@ def main() -> None:
         "the latest `make sweep-grid` run on real broker data. The "
         "⭐ rows are the curated portfolio that pre-fills on the **Live** "
         "tab.")
+    st.caption(
+        f"⚖️ **Benchmark** — {cost_defaults.cost_config_badge()}. "
+        f"Same cost config used by Backtest page, Composer, Compare, "
+        f"sweep_grid. Run `python scripts/rebaseline_catalog.py` after "
+        f"changing `core/cost_defaults.py` to refresh every cell."
+    )
 
     cat = edge_catalog.load_catalog()
     if not cat:
@@ -319,28 +751,93 @@ def main() -> None:
     st.markdown("")
     _render_distribution_chart(entries)
     st.markdown("---")
+    _render_trendo_heatmap(entries)
+    st.markdown("---")
 
     st.markdown("### Cells ranked by out-of-sample R")
+    st.caption(
+        "💡 Click the **📊 Backtest** link on any row to open that cell "
+        "with the EXACT config that produced its metrics — fresh run "
+        "reproduces these numbers. For replay-parity / deploy, scroll "
+        "down to the **🔍 Deep-dive** section."
+    )
+    st.caption(
+        "⭐ = curated **AND** passes every hard gate (PF ≥ 1.05, "
+        "TEST PF ≥ 1.0, recovery ≤ 90d, n_test ≥ 20). "
+        "📍 = curated but currently failing a gate (legacy entry, "
+        "may need re-baseline). No icon = uncurated cell from the "
+        "broader sweep."
+    )
     df = _table(entries)
     if df.empty:
         st.caption("(no entries after filters)")
         return
-    # Style: green for positive R / PF, red for negative
-    def _color_r(v):
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return "color: #9ca3af;"
-        if f > 0:
-            return "color: #16a34a; font-weight: 600;"
-        if f < 0:
-            return "color: #dc2626; font-weight: 600;"
-        return "color: #9ca3af;"
 
-    styled = df.style.map(_color_r,
-                            subset=["R_test", "R_train", "PF_test", "PF_train"])
-    st.dataframe(styled, use_container_width=True,
-                   height=min(720, 38 * (len(df) + 1)))
+    # Phase-32: Edge Score column from `core.edge_score`. Multi-metric
+    # ranking (Kelly + expectancy + recovery×frequency + Sharpe-R +
+    # deploy_safe). Strictly better than raw PF or test_R alone for
+    # picking deployable cells. Default-sortable.
+    from core import edge_score as _es
+    edge_scores = []
+    for e in entries:
+        if e.edge is None:
+            edge_scores.append(0.0)
+            continue
+        try:
+            edge_scores.append(round(
+                _es.compute_from_edge_stat(e.edge).total, 1
+            ))
+        except Exception:
+            edge_scores.append(0.0)
+    df["Edge Score"] = edge_scores
+
+    # Phase-32: Edge Score explainer — same across all 4 pages
+    from dashboards.components import edge_score_explainer
+    edge_score_explainer.render_explainer(expanded=False)
+
+    # Append a 📊 Backtest LinkColumn — the catalog's source_config_json
+    # is embedded so a fresh run reproduces the catalog metrics. Cells
+    # without an EdgeStat (legacy seed-only entries) get an empty link
+    # which Streamlit renders as plain text.
+    from dashboards.components.backtest_link import build_backtest_url
+    df["📊 Backtest"] = [
+        (build_backtest_url(e.edge) if e.edge is not None else "")
+        for e in entries
+    ]
+
+    # Streamlit's LinkColumn requires a non-styled DataFrame, so we drop
+    # the per-cell red/green text colour in exchange for clickable rows
+    # — a UX trade the user explicitly asked for. Visual cues live in
+    # the existing "Trendo EV" column (✅/🟡/🔴 emoji) and the row icons
+    # ("rec" star, "edge?" ✅/—, "confidence" ✓/⚠).
+    column_cfg = {
+        "📊 Backtest": st.column_config.LinkColumn(
+            "📊 Backtest",
+            display_text="Open",
+            help="Open this cell in the Backtest page with its stored "
+                  "config — fresh run will reproduce these metrics.",
+        ),
+        "Edge Score": st.column_config.NumberColumn(
+            "Edge Score",
+            format="%.1f",
+            help=edge_score_explainer.COLUMN_HEADER_HELP,
+        ),
+        "PF_test": st.column_config.NumberColumn(format="%.2f"),
+        "R_test":  st.column_config.NumberColumn(format="%+.3f"),
+        "win%":    st.column_config.NumberColumn(format="%.1f%%"),
+        "maxDD%":  st.column_config.NumberColumn(format="%.1f%%"),
+        "netPnL$": st.column_config.NumberColumn(format="$%+,.0f"),
+        "avgWin$": st.column_config.NumberColumn(format="$%+,.0f"),
+        "avgLoss$": st.column_config.NumberColumn(format="$%+,.0f"),
+        "maxDD$":  st.column_config.NumberColumn(format="$%,.0f"),
+        "rr":      st.column_config.NumberColumn(format="%.2f"),
+    }
+    st.dataframe(
+        df, width="stretch",
+        hide_index=True,
+        height=min(720, 38 * (len(df) + 1)),
+        column_config=column_cfg,
+    )
 
     # ── Drill-down panel: pick a cell, run the backtest inline, show
     # full stats + equity curve + drawdown.
@@ -352,28 +849,194 @@ def main() -> None:
     if not entries:
         st.caption("(no entries to drill into)")
     else:
-        labels = {f"{e.strategy} · {e.ticker} · {e.tf}"
-                  + (" ⭐" if e.recommended else ""): e for e in entries}
+        # Selector icons mirror the table's `rec` column:
+        #   ⭐ = curated AND deploy_safe AND n_test ≥ 20 (truly safe)
+        #   📍 = curated but currently failing a hard gate
+        #   (blank) = not in curated list
+        def _badge(_e):
+            if _e.is_starred:
+                return " ⭐"
+            if _e.recommended:
+                return " 📍"
+            return ""
+        labels = {f"{e.strategy} · {e.ticker} · {e.tf}{_badge(e)}": e
+                  for e in entries}
         choice = st.selectbox(
             "cell", options=list(labels.keys()),
             key="lib_drilldown_pick",
         )
-        cols_in = st.columns([1, 1, 1])
+        cols_in = st.columns([1, 1, 1, 1])
         start_bal = float(cols_in[0].number_input(
-            "Starting balance ($)", value=100_000.0,
+            "Starting balance ($)",
+            value=cost_defaults.DEFAULT_STARTING_BALANCE_USD,
             step=10_000.0, min_value=1_000.0,
             key="lib_drill_start"))
         train_pct = float(cols_in[1].slider(
             "Train split %", min_value=0.5, max_value=0.9,
-            value=0.6, step=0.05, key="lib_drill_train"))
+            value=cost_defaults.DEFAULT_TRAIN_PCT,
+            step=0.05, key="lib_drill_train"))
         comm = float(cols_in[2].number_input(
-            "Commission $/trade", value=3.0, step=0.5,
+            "Commission $/trade",
+            value=cost_defaults.DEFAULT_COMMISSION_USD, step=0.5,
             key="lib_drill_comm"))
-        if st.button("▶  Run deep-dive backtest", type="primary",
+        slip = float(cols_in[3].number_input(
+            "Slippage (× ATR)",
+            value=cost_defaults.DEFAULT_SLIPPAGE_ATR_FRAC,
+            step=0.05, format="%.3f", key="lib_drill_slip"))
+        st.caption(
+            f"⚖️ Defaults from `core.cost_defaults` — same setup the "
+            f"catalog rows above were measured under, so a fresh "
+            f"deep-dive run reproduces them. Override here for "
+            f"what-if scenarios."
+        )
+        # ─── Action row 1: Inline deep-dive · Replay-parity ─────────
+        # Inline backtest renders below this panel. The 📊 Open in
+        # Backtest page button uses the SAME config but routes to the
+        # dedicated Backtest page (URL-shareable, equity charts, etc).
+        action_cols = st.columns([2, 2, 2])
+        if action_cols[0].button("▶  Run deep-dive backtest",
+                       type="primary",
+                       width="stretch",
                        key="lib_drill_run"):
             entry = labels[choice]
             _run_drilldown(entry, start_bal=start_bal,
-                            train_pct=train_pct, commission=comm)
+                            train_pct=train_pct, commission=comm,
+                            slippage=slip)
+        if action_cols[1].button(
+            "🔬  Run replay-parity",
+            width="stretch",
+            key="lib_drill_parity",
+            help="Verify backtest == bar-by-bar replay (must match within "
+                  "$0.01) before this strategy can deploy live. PASS records "
+                  "to the parity gate for 24h.",
+        ):
+            entry = labels[choice]
+            _run_replay_parity_inline(entry)
+        # 📊 Open the SAME cell in the dedicated Backtest page with the
+        # full source_config_json embedded in the URL — fresh run there
+        # reproduces these metrics exactly. Uses the shared helper.
+        from dashboards.components.backtest_link import build_backtest_url
+        _entry_for_link = labels[choice]
+        if _entry_for_link.edge is not None:
+            action_cols[2].link_button(
+                "📊  Open in Backtest page",
+                build_backtest_url(_entry_for_link.edge),
+                width="stretch",
+                help="Opens the dedicated Backtest page with the EXACT "
+                      "config that produced this cell's catalog metrics. "
+                      "Fresh run will reproduce them.",
+            )
+        else:
+            action_cols[2].caption(
+                "_(no catalog config — use inline deep-dive)_"
+            )
+
+        # ─── Action row 2: Deploy ────────────────────────────────────
+        # Quality gate + parity gate status together, so the user knows
+        # exactly what's blocking before they click.
+        from core.deployment_quality_gate import (
+            evaluate_quality as _eval_q,
+            load_criteria as _load_q,
+        )
+        from dashboards.components.state import discover_strategies as _ds
+        from dashboards.components.strategy_resolver import (
+            resolve_base_strategy as _rb,
+        )
+        _entry_now = labels[choice]
+        _gate = ParityGate(REPO / "data" / "v2.db")
+        _base = _rb(_entry_now.strategy, _ds()) or _entry_now.strategy
+        _parity_ok = _gate.is_recent(_base)
+        _last_pass = _gate.last_pass_for(_base)
+
+        # Quality gate verdict for the SELECTED row (with default criteria)
+        if _entry_now.edge is not None:
+            try:
+                _q = _eval_q(_entry_now.edge, criteria=_load_q(
+                    accounts := account_manager.list_accounts(),
+                    accounts[0].login if accounts else 0,
+                ) if False else None)
+            except Exception:
+                _q = _eval_q(_entry_now.edge)
+        else:
+            _q = None
+
+        if _q is not None:
+            if _q.is_blocked:
+                with st.container(border=True):
+                    st.error(
+                        f"⛔ **Quality gate: BLOCK** "
+                        f"({len(_q.block_reasons)} failure(s))"
+                    )
+                    for reason in _q.block_reasons:
+                        st.markdown(f"- {reason}")
+                    st.markdown(
+                        "Live deploy is refused. To override (not "
+                        "recommended), type `I UNDERSTAND` below "
+                        "before clicking deploy. The override forces "
+                        "paper mode regardless of which button you click."
+                    )
+            elif _q.verdict == "WARN":
+                with st.container(border=True):
+                    st.warning(
+                        f"🟡 **Quality gate: WARN** "
+                        f"({len(_q.warn_reasons)} concern(s))"
+                    )
+                    for reason in _q.warn_reasons:
+                        st.markdown(f"- {reason}")
+            else:
+                st.success(
+                    f"✅ Quality gate: OK "
+                    f"({len(_q.pass_notes)} checks passed)"
+                )
+
+        if _parity_ok and _last_pass:
+            ts = _last_pass[0].strftime("%Y-%m-%d %H:%M")
+            st.success(
+                f"✅ Parity OK for `{_base}` (last pass {ts} UTC, "
+                f"divergence ${_last_pass[1]:.6f}). Live deploy "
+                f"unlocked (subject to quality gate)."
+            )
+        else:
+            st.warning(
+                f"⚠ No recent (<24h) parity pass for `{_base}`. "
+                f"Click **🔬 Run replay-parity** above to unlock live "
+                f"deploy. Paper deploy works either way."
+            )
+
+        # Override-token text input — only matters when quality is BLOCK
+        override_token = ""
+        if _q is not None and _q.is_blocked:
+            override_token = st.text_input(
+                "Quality override token (type `I UNDERSTAND` to bypass)",
+                value="", key="lib_quality_override",
+                placeholder="leave blank to respect the BLOCK",
+            )
+
+        deploy_cols = st.columns([2, 2])
+        if deploy_cols[0].button("🟡  Add to paper",
+                                    width="stretch",
+                                    key="lib_add_paper"):
+            entry = labels[choice]
+            _add_single_to_account(entry, status="paper",
+                                      quality_override_token=override_token)
+        # Live button disabled when EITHER gate is failing
+        live_disabled = (not _parity_ok) or (_q is not None
+                                                and _q.is_blocked
+                                                and override_token
+                                                != "I UNDERSTAND")
+        if deploy_cols[1].button(
+            "🟢  Add to live",
+            width="stretch",
+            key="lib_add_live",
+            type="primary" if not live_disabled else "secondary",
+            disabled=live_disabled,
+            help=(None if not live_disabled
+                  else "Pass replay-parity AND quality gate to unlock "
+                        "(or type override token)"),
+        ):
+            entry = labels[choice]
+            _add_single_to_account(entry, status="live",
+                                      quality_override_token=override_token)
 
     st.markdown("---")
     st.markdown(

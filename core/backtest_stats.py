@@ -244,6 +244,57 @@ def compute_full_stats(result, *, starting_balance: float) -> FullStats:
     )
 
 
+def slice_result_to_oos(result, *, split_bar_idx: int,
+                          candles: pd.DataFrame,
+                          rebase_to: float | None = None):
+    """Return a new BacktestResult-shaped dataclass where BOTH trades
+    AND equity_curve are restricted to the out-of-sample region.
+
+    Why this matters: the previous code did `dataclasses.replace(result,
+    trades=oos_trades)` which kept the full-history equity_curve. So
+    stats like max_dd_pct / max_dd_duration_days / recovery_duration_days
+    were computed against the FULL backtest while win% / sum_realized
+    were OOS-only. Result: contradictory numbers (e.g. positive net
+    P&L but recovery_days=None because the *full* curve never recovered
+    its all-time peak).
+
+    Parameters
+    ----------
+    split_bar_idx : int
+        Bar index where OOS starts. Trades with entry_bar_idx >= this
+        are OOS.
+    candles : pd.DataFrame
+        The full candle frame — used to look up the timestamp at
+        split_bar_idx so equity_curve can be filtered by time.
+    rebase_to : float | None
+        If set, the OOS equity curve is shifted so it starts at this
+        value (typically 100_000 to mirror an FTMO challenge starting
+        fresh on the OOS day-1). If None, the curve is kept at the
+        actual level it had at the train→test boundary.
+    """
+    import dataclasses
+
+    if split_bar_idx <= 0 or split_bar_idx >= len(candles):
+        return result
+    split_time = pd.to_datetime(
+        candles["time"].iloc[split_bar_idx], utc=True, errors="coerce",
+    )
+    oos_trades = [t for t in (result.trades or [])
+                   if t.entry_bar_idx >= split_bar_idx]
+    eq = result.equity_curve
+    if eq is None or eq.empty:
+        return dataclasses.replace(result, trades=oos_trades)
+    eq = eq.copy()
+    eq["time"] = pd.to_datetime(eq["time"], utc=True, errors="coerce")
+    eq = eq.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+    eq = eq[eq["time"] >= split_time].reset_index(drop=True)
+    if rebase_to is not None and not eq.empty:
+        offset = rebase_to - float(eq["equity"].iloc[0])
+        eq = eq.copy()
+        eq["equity"] = eq["equity"].astype(float) + offset
+    return dataclasses.replace(result, trades=oos_trades, equity_curve=eq)
+
+
 def rescale_to_starting_balance(result, target_starting: float):
     """Return a new equity-curve DataFrame scaled so it starts at
     `target_starting`. Used by the dashboard so the user can see "what

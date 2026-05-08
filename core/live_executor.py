@@ -50,6 +50,31 @@ class SafetyCheckRejection(Exception):
         self.reason = reason
 
 
+class BridgeCloseFailed(Exception):
+    """The bridge refused or errored on a position_close, even after
+    retries. Caller (HALT button, force-flat, demote) should mark the
+    deployment as halted, surface the message in the UI, and ask the
+    user to close the position manually in MT5."""
+
+
+class BridgeOrderRejected(Exception):
+    """The bridge accepted the request but the broker rejected the
+    order — bad volume, market closed, no money, off-quote, etc.
+
+    .retcode contains the MT5 trade return code (e.g. 10018 = market closed).
+    .bridge_response carries the raw response dict for debugging.
+
+    PRIOR BUG: `LiveExecutor.send_order` used to silently swallow
+    these and return a `LiveOrder` with ticket=0 — the runner thought
+    the order had succeeded. Now it raises and the runner records the
+    real error in `TickResult.errors`."""
+    def __init__(self, msg: str, *, retcode: int = 0,
+                  bridge_response: dict | None = None):
+        super().__init__(msg)
+        self.retcode = retcode
+        self.bridge_response = bridge_response or {}
+
+
 @dataclass
 class LiveOrder:
     """Metadata for a sent (mocked or real) order."""
@@ -126,10 +151,54 @@ class LiveExecutor:
             cooldown_minutes=240,
             daily_loss_cap_pct=risk_config.daily_loss_cap_pct,
         )
-        self.parity_gate = parity_gate or ParityGate(self.db_path)
+        # Bug A fix (2026-05-08): the runner DB lives at
+        # data/accounts/<login>/v2.db, but dashboard pages historically
+        # wrote parity passes to the main repo DB at REPO/data/v2.db.
+        # Without a fallback, every live preflight asks "is parity
+        # recent?" against the empty account DB and gets False, so the
+        # bot never sends an order. We add the main repo DB as a
+        # read+write-mirror fallback so existing parity rows are visible
+        # AND new passes are kept in sync.
+        #
+        # The fallback is opt-in via env var MT5QT_PARITY_FALLBACK_REPO
+        # (default "1" = enabled in production) so test fixtures that
+        # build a LiveExecutor in tmp_path don't accidentally pick up
+        # parity rows from the actual repo DB. Set to "0" in tests.
+        if parity_gate is not None:
+            self.parity_gate = parity_gate
+        else:
+            self.parity_gate = self._build_default_parity_gate()
 
         # In-memory dedup of recent idempotency_keys: key → seen_at_unix
         self._seen_keys: dict[str, float] = {}
+
+    def _build_default_parity_gate(self) -> "ParityGate":
+        """Construct the default ParityGate for production use.
+
+        Adds REPO/data/v2.db as a fallback so existing parity rows
+        written by dashboard pages (which historically wrote to the
+        main repo DB) are visible to the runner that uses the
+        per-account DB. Opt-out for tests via env var:
+            MT5QT_PARITY_FALLBACK_REPO=0
+        """
+        import os
+        opt_in = os.environ.get("MT5QT_PARITY_FALLBACK_REPO", "1") not in (
+            "0", "false", "False", "no", "NO", "",
+        )
+        fallbacks: list[Path] = []
+        if opt_in:
+            try:
+                # core/live_executor.py is at REPO/core/, so REPO is
+                # parent.parent. Only fall back when the runner DB
+                # differs from the main repo DB.
+                repo_root = Path(__file__).resolve().parent.parent
+                main_db = repo_root / "data" / "v2.db"
+                if main_db.resolve() != self.db_path.resolve():
+                    fallbacks.append(main_db)
+            except Exception:
+                log.debug("could not compute repo-root fallback",
+                          exc_info=True)
+        return ParityGate(self.db_path, fallback_db_paths=fallbacks)
 
     # --- pre-flight checks (return reason string on FAIL, None on PASS) ---
 
@@ -252,18 +321,6 @@ class LiveExecutor:
         t0 = time.time()
         try:
             resp = self._call("order_send", params)
-            latency_ms = int((time.time() - t0) * 1000)
-            ok = isinstance(resp, dict) and resp.get("ok", True) is not False
-            storage.record_bridge_event(
-                self.db_path, now.isoformat(), "order_send",
-                ok, latency_ms, None if ok else str(resp.get("error", resp)),
-            )
-            ticket = int(resp.get("ticket") or resp.get("data", {}).get("ticket") or 0)
-            return LiveOrder(
-                ticket=ticket, symbol=symbol, direction=direction, lots=lots,
-                sl=sl, tp=tp, sent_at_utc=now.isoformat(),
-                idempotency_key=idempotency_key, bridge_response=resp,
-            )
         except Exception as e:
             latency_ms = int((time.time() - t0) * 1000)
             storage.record_bridge_event(
@@ -271,12 +328,82 @@ class LiveExecutor:
                 False, latency_ms, f"{type(e).__name__}: {e}",
             )
             raise
+        latency_ms = int((time.time() - t0) * 1000)
+
+        # CRITICAL: previously this code defaulted ok=True when the "ok"
+        # key was missing — meaning a malformed bridge response or a
+        # broker rejection (e.g. retcode != TRADE_RETCODE_DONE) silently
+        # passed through, and the runner thought the order had succeeded
+        # while no position existed on the broker. Now: missing or False
+        # ok = explicit failure with the retcode/error preserved.
+        if not isinstance(resp, dict):
+            storage.record_bridge_event(
+                self.db_path, now.isoformat(), "order_send",
+                False, latency_ms,
+                f"bridge returned non-dict: {type(resp).__name__}",
+            )
+            raise BridgeOrderRejected(
+                f"order_send returned non-dict response: "
+                f"{type(resp).__name__}",
+                bridge_response={"raw": str(resp)},
+            )
+        d = resp.get("data", resp)
+        # Treat missing "ok" key as FAILURE (not optimistic success).
+        ok_raw = d.get("ok", resp.get("ok"))
+        if ok_raw is None or ok_raw is False:
+            err = str(resp.get("error", d.get("error", "")) or "")
+            retcode = int(d.get("retcode", 0) or 0)
+            comment = str(d.get("comment", ""))
+            msg = (
+                f"order REJECTED by broker — "
+                f"retcode={retcode} "
+                f"error={err!r} comment={comment!r}"
+            )
+            storage.record_bridge_event(
+                self.db_path, now.isoformat(), "order_send",
+                False, latency_ms, msg,
+            )
+            raise BridgeOrderRejected(msg, retcode=retcode,
+                                          bridge_response=resp)
+
+        # ok=True path — extract ticket; if it's 0 that's also a failure
+        ticket = int(d.get("ticket", resp.get("ticket", 0)) or 0)
+        if ticket == 0:
+            msg = (
+                f"order_send returned ok=True but ticket=0 — bridge "
+                f"contract violated. response={resp}"
+            )
+            storage.record_bridge_event(
+                self.db_path, now.isoformat(), "order_send",
+                False, latency_ms, msg,
+            )
+            raise BridgeOrderRejected(msg, bridge_response=resp)
+
+        storage.record_bridge_event(
+            self.db_path, now.isoformat(), "order_send",
+            True, latency_ms, None,
+        )
+        return LiveOrder(
+            ticket=ticket, symbol=symbol, direction=direction, lots=lots,
+            sl=sl, tp=tp, sent_at_utc=now.isoformat(),
+            idempotency_key=idempotency_key, bridge_response=resp,
+        )
 
     def close_position(self, *, ticket: int, comment: str = "",
-                        now_utc: Optional[datetime] = None) -> CloseResult:
+                        now_utc: Optional[datetime] = None,
+                        retries: int = 2) -> CloseResult:
         """Close an open position. EMERGENCY_STOP and account-allowed are
         re-checked, but no_entry_window does NOT block closes (closes are
-        always allowed; that's how forced-flats reach the broker)."""
+        always allowed; that's how forced-flats reach the broker).
+
+        BUG FIX (Phase 30): the bridge method was previously called
+        `order_close`, but the MT5 EA registers it as `position_close`.
+        That meant every HALT/Demote-to-paper / forced-flat silently
+        failed at the bridge — the position stayed open on the broker.
+        Renamed to match the EA. Also: retry on transient bridge errors
+        (broker rejections, requotes) before giving up — closes MUST
+        succeed because they're how risk caps reach the account.
+        """
         now = now_utc or datetime.now(timezone.utc)
         for cid, reason in (
             ("emergency_stop", self._check_emergency_stop()),
@@ -289,26 +416,56 @@ class LiveExecutor:
         if self._call is None:
             raise RuntimeError("no bridge_call configured")
 
-        t0 = time.time()
-        try:
-            resp = self._call("order_close", {"ticket": ticket, "comment": comment})
-            latency_ms = int((time.time() - t0) * 1000)
-            ok = isinstance(resp, dict) and resp.get("ok", True) is not False
-            storage.record_bridge_event(
-                self.db_path, now.isoformat(), "order_close", ok,
-                latency_ms, None if ok else str(resp.get("error", resp)),
-            )
-            return CloseResult(
-                ticket=ticket, closed_at_utc=now.isoformat(),
-                reason=comment, bridge_response=resp,
-            )
-        except Exception as e:
-            latency_ms = int((time.time() - t0) * 1000)
-            storage.record_bridge_event(
-                self.db_path, now.isoformat(), "order_close",
-                False, latency_ms, f"{type(e).__name__}: {e}",
-            )
-            raise
+        last_err = None
+        for attempt in range(max(1, int(retries) + 1)):
+            t0 = time.time()
+            try:
+                resp = self._call(
+                    "position_close",
+                    {"ticket": int(ticket), "comment": str(comment)},
+                )
+                latency_ms = int((time.time() - t0) * 1000)
+                # The bridge wraps the result under data on success, OR
+                # returns a top-level error key on failure. Treat either
+                # `ok=False` or an `error` field as a failed attempt.
+                if isinstance(resp, dict):
+                    payload = resp.get("data", resp)
+                    ok = bool(payload.get("ok", resp.get("ok", True)))
+                    if "error" in resp and not ok:
+                        ok = False
+                else:
+                    ok = False
+                storage.record_bridge_event(
+                    self.db_path, now.isoformat(), "position_close", ok,
+                    latency_ms,
+                    None if ok else str(
+                        (resp or {}).get("error", resp)
+                        if isinstance(resp, dict) else resp
+                    ),
+                )
+                if ok:
+                    return CloseResult(
+                        ticket=ticket, closed_at_utc=now.isoformat(),
+                        reason=comment, bridge_response=resp,
+                    )
+                # Not OK — set last_err and retry
+                last_err = (resp or {}).get("error") if isinstance(resp, dict) else resp
+            except Exception as e:
+                latency_ms = int((time.time() - t0) * 1000)
+                storage.record_bridge_event(
+                    self.db_path, now.isoformat(), "position_close",
+                    False, latency_ms, f"{type(e).__name__}: {e}",
+                )
+                last_err = e
+            # Backoff between retries (cap at attempt 2 with 0.5s pause)
+            if attempt < retries:
+                time.sleep(0.3 * (attempt + 1))
+        # All retries exhausted — surface the last error so the caller
+        # can flip the deployment to halted, log it, surface in UI.
+        raise BridgeCloseFailed(
+            f"position_close({ticket}) failed after "
+            f"{retries + 1} attempt(s): {last_err}"
+        )
 
     # --- helpers ---
 

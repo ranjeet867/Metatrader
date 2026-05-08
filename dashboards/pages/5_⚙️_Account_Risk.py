@@ -76,7 +76,7 @@ def render_per_strategy_risk():
         "last_loss_at_utc", "cooldown_until_utc",
         "daily_loss_pct", "day_start_balance",
     ])
-    st.dataframe(df, use_container_width=True,
+    st.dataframe(df, width="stretch",
                   height=min(360, 36 * (len(df) + 1)))
 
 
@@ -99,7 +99,7 @@ def render_emergency_stop_section():
     if not has_stop:
         if cols[0].button("⛔  Activate EMERGENCY_STOP",
                               type="primary",
-                              use_container_width=True,
+                              width="stretch",
                               key="ar_estop_on"):
             confirm_key = "ar_estop_confirm"
             st.session_state[confirm_key] = True
@@ -116,7 +116,7 @@ def render_emergency_stop_section():
     else:
         if cols[0].button("✅  Lift EMERGENCY_STOP",
                               type="secondary",
-                              use_container_width=True,
+                              width="stretch",
                               key="ar_estop_off"):
             sentinel.unlink(missing_ok=True)
             st.toast("EMERGENCY_STOP removed")
@@ -175,44 +175,88 @@ def render_position_sizing_section():
         stop = entry - stop_dist
         res = calc_lots(equity=equity, risk_pct=risk_pct,
                           entry_price=entry, stop_price=stop, sym=info)
+        # NB: failed-row placeholders MUST be NaN (not "—") so pyarrow
+        # can serialise the column for st.dataframe — mixing strings
+        # with floats throws ArrowInvalid. Column-config renders NaN
+        # as the em-dash visually, same UX without the type collision.
         rows.append({
             "symbol": sym,
             "typical_entry": entry,
             "stop_distance": round(stop_dist, info.digits),
-            "lots": round(res.lots, 4) if res.ok else "—",
-            "$ at risk": round(res.money_risk, 2) if res.ok else "—",
+            "lots": (round(res.lots, 4) if res.ok else float("nan")),
+            "$ at risk": (round(res.money_risk, 2) if res.ok
+                              else float("nan")),
             "result": "ok" if res.ok else res.reason,
         })
     st.markdown(f"**Projected lots at {risk_pct:.2f}% on ${equity:,.0f} equity**")
-    st.dataframe(pd.DataFrame(rows), use_container_width=True,
-                  height=min(420, 36 * (len(rows) + 1)))
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        height=min(420, 36 * (len(rows) + 1)),
+        column_config={
+            "lots": st.column_config.NumberColumn("lots", format="%.4f"),
+            "$ at risk": st.column_config.NumberColumn(
+                "$ at risk", format="$%.2f"),
+        },
+    )
 
 
 def render_risk_caps_editor(cfg):
-    st.markdown("### ⚙️  Risk caps (data/risk_config.json)")
-    st.caption(
-        "Edits save to `data/risk_config.json`. The dashboard re-reads on "
-        "every page load."
+    st.markdown("### ⚙️  Per-strategy risk caps (`data/risk_config.json`)")
+    st.info(
+        "**Layer 1 of 2 — per-strategy soft cooldown.** These limits "
+        "pause a SINGLE strategy after it loses; other deployments keep "
+        "trading. Stored in `data/risk_config.json`.\n\n"
+        "**For account-wide HALT (kills ALL deployments) → use Command "
+        "Center → System guardrails.** Both layers fire independently — "
+        "whichever trips first wins.",
+        icon="🛡️",
     )
     cur = cfg.raw
     with st.form("risk_caps_form"):
         cols = st.columns(3)
-        new_daily = cols[0].number_input("daily_loss_cap_pct",
-                                            value=float(cur["daily_loss_cap_pct"]),
-                                            step=0.5, format="%.2f")
-        new_consec = int(cols[1].number_input("max_consecutive_losses",
-                                                  value=int(cur["max_consecutive_losses"]),
-                                                  step=1))
-        new_max_open = int(cols[2].number_input("max_open_positions",
-                                                    value=int(cur["max_open_positions"]),
-                                                    step=1))
+        new_daily = cols[0].number_input(
+            "daily_loss_cap_pct",
+            value=float(cur["daily_loss_cap_pct"]),
+            step=0.5, format="%.2f",
+            help="ACCOUNT-WIDE % cap (Layer 1). Denies opens via "
+                  "LiveRiskTracker when today's loss ≥ this %. Compare "
+                  "with Command Center's $-based daily_loss_dollars — "
+                  "whichever fires first wins.",
+        )
+        new_consec = int(cols[1].number_input(
+            "max_consecutive_losses",
+            value=int(cur["max_consecutive_losses"]),
+            step=1,
+            help="PER-STRATEGY cooldown. After N losses on ONE strategy "
+                  "it pauses for cooldown_minutes (default 240). Other "
+                  "strategies keep going. Command Center's "
+                  "max_consec_losses is more aggressive — it HALTS the "
+                  "WHOLE account.",
+        ))
+        new_max_open = int(cols[2].number_input(
+            "max_open_positions",
+            value=int(cur["max_open_positions"]),
+            step=1,
+            help="DUPLICATED in Command Center. Both check the same "
+                  "thing across all deployments — the SMALLER value "
+                  "wins. Recommend: keep them in sync.",
+        ))
         cols2 = st.columns(2)
-        new_no_entry = int(cols2[0].number_input("no_entry_minutes_before_close",
-                                                    value=int(cur["no_entry_minutes_before_close"]),
-                                                    step=5))
-        new_buffer = int(cols2[1].number_input("flat_buffer_minutes",
-                                                  value=int(cur["flat_buffer_minutes"]),
-                                                  step=1))
+        new_no_entry = int(cols2[0].number_input(
+            "no_entry_minutes_before_close",
+            value=int(cur["no_entry_minutes_before_close"]),
+            step=5,
+            help="Time-guard: refuse to open a new position within N "
+                  "minutes of session close. Prevents holding overnight.",
+        ))
+        new_buffer = int(cols2[1].number_input(
+            "flat_buffer_minutes",
+            value=int(cur["flat_buffer_minutes"]),
+            step=1,
+            help="Time-guard: force-close positions N minutes before "
+                  "weekend / daily flat times.",
+        ))
         if st.form_submit_button("💾  Save"):
             new_cfg = dict(cur)
             new_cfg["daily_loss_cap_pct"] = new_daily
@@ -225,6 +269,68 @@ def render_risk_caps_editor(cfg):
                 st.success("Saved. Re-run other pages to pick up the change.")
             except Exception as e:
                 st.error(f"Save failed: {e}")
+
+    # Cross-check vs Command Center
+    _render_layer_consistency_check(cfg)
+
+
+def _render_layer_consistency_check(cfg):
+    """Compare Layer 1 (risk_config.json) ↔ Layer 2 (circuit_breaker.json)
+    and warn on inconsistencies — the 'why are there two of these?'
+    confusion."""
+    try:
+        from core import account_manager, circuit_breaker as cb
+        active = account_manager.load_active_account()
+        if active is None:
+            return
+        cb_cfg = cb.load_config(active.login)
+    except Exception:
+        return
+
+    st.markdown("---")
+    st.markdown("##### 🔗 Cross-layer consistency check")
+    st.caption(
+        "Both layers fire independently. The smaller / earlier limit "
+        "wins. Mismatches below indicate the two pages disagree about "
+        "the same threshold — fix one of them so behaviour is "
+        "predictable."
+    )
+    issues = []
+
+    # max_open_positions: same name, both account-wide
+    l1_open = int(cfg.raw.get("max_open_positions", 0))
+    l2_open = int(cb_cfg.max_open_positions or 0)
+    if l1_open and l2_open and l1_open != l2_open:
+        issues.append(
+            f"`max_open_positions` — Layer 1: **{l1_open}**, Layer 2: "
+            f"**{l2_open}**. Effective cap = `{min(l1_open, l2_open)}` "
+            f"(smaller wins)."
+        )
+
+    # daily loss: % vs $ — convert one for comparison if equity is known
+    try:
+        from core.mt5_account import MT5AccountClient
+        equity = float(MT5AccountClient().account_info().equity or 0)
+    except Exception:
+        equity = 0.0
+    if equity > 0:
+        l1_pct = float(cfg.raw.get("daily_loss_cap_pct", 0))
+        l1_dollars = equity * l1_pct / 100.0 if l1_pct else 0
+        l2_dollars = float(cb_cfg.daily_loss_dollars or 0)
+        if l1_dollars and l2_dollars and abs(l1_dollars - l2_dollars) > 50:
+            issues.append(
+                f"`daily_loss` — Layer 1: **{l1_pct:.2f}%** "
+                f"(≈${l1_dollars:,.0f} on current equity), "
+                f"Layer 2: **${l2_dollars:,.0f}**. "
+                f"First to fire HALTS — likely "
+                f"`{'Layer 2' if l2_dollars < l1_dollars else 'Layer 1'}`."
+            )
+
+    if not issues:
+        st.success("✅ Layer 1 ↔ Layer 2 settings are consistent.")
+    else:
+        for msg in issues:
+            st.warning(msg, icon="⚠️")
 
 
 def render_ftmo_pass_rate_widget():
@@ -409,12 +515,28 @@ def render_ftmo_pass_rate_widget():
         })
     contrib_df = pd.DataFrame(contrib_rows).sort_values(
         "contrib_return_%", ascending=False)
-    st.dataframe(contrib_df, use_container_width=True)
+    st.dataframe(contrib_df, width="stretch")
 
 
 def main():
     st.set_page_config(page_title="Account & Risk", page_icon="⚙️", layout="wide")
     st.title("⚙️  Account & Risk")
+    # Phase-32: edits for risk caps moved to the unified ⚙️ Settings page
+    # (file `_⚙️_Settings.py`). This page remains as a READ-ONLY view of
+    # FTMO progress, time-guard countdowns, sizing simulator, and the
+    # emergency-stop control. Risk-caps editor at the bottom is now
+    # disabled — it's still rendered for context but with a banner
+    # pointing users to Settings.
+    st.info(
+        "ℹ️ **Risk-cap editing has moved to the ⚙️ Settings page.** "
+        "Sections below show your live account, FTMO progress, the "
+        "sizing simulator, and time-guard countdowns. To EDIT risk "
+        "caps (daily-loss %, max consecutive losses, max open "
+        "positions, no-entry window, weekend-flat, etc.) open **⚙️ "
+        "Settings → A. Account-wide risk caps** instead — that's the "
+        "single source of truth across the dashboard.",
+        icon="ℹ️",
+    )
     cfg = load_config()
     render_account_section()
     render_ftmo_progress(cfg)
@@ -422,7 +544,7 @@ def main():
     render_per_strategy_risk()
     render_time_guards(cfg)
     render_emergency_stop_section()
-    render_risk_caps_editor(cfg)
+    # render_risk_caps_editor(cfg) — moved to ⚙️ Settings
     render_ftmo_pass_rate_widget()
 
 

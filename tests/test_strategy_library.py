@@ -33,7 +33,67 @@ def patch_grid(tmp_path, monkeypatch):
     f = tmp_path / "grid.md"
     f.write_text(SAMPLE_MD)
     monkeypatch.setattr(edge_catalog, "DEFAULT_GRID_PATH", f)
+    # Also isolate from auto-discovery from data/v2.db so tests see
+    # only the SAMPLE_MD content (not real backtest runs).
+    monkeypatch.setattr(edge_catalog, "DEFAULT_DB_PATH",
+                          tmp_path / "absent.db")
     return f
+
+
+def test_is_starred_requires_curated_and_safe_and_sample():
+    """⭐ only when (recommended AND deploy_safe AND n_test ≥ 20)."""
+    es_safe_big = edge_catalog.EdgeStat(
+        ticker="X", tf="D1", strategy="s",
+        n_train=30, train_pf=1.5, train_r=0.2,
+        n_test=25, test_pf=1.5, test_r=0.2,
+        hard_gate_failed=(),
+    )
+    es_safe_small = edge_catalog.EdgeStat(
+        ticker="X", tf="D1", strategy="s",
+        n_train=20, train_pf=1.5, train_r=0.2,
+        n_test=16, test_pf=1.5, test_r=0.2,
+        hard_gate_failed=(),
+    )
+    es_unsafe = edge_catalog.EdgeStat(
+        ticker="X", tf="D1", strategy="s",
+        n_train=30, train_pf=1.5, train_r=0.2,
+        n_test=25, test_pf=1.5, test_r=0.2,
+        hard_gate_failed=("Recovery: not yet",),
+    )
+
+    e_curated_safe_big = strategy_library.LibraryEntry(
+        strategy="s", ticker="X", tf="D1", long_only=True,
+        recommended=True, edge=es_safe_big,
+    )
+    assert e_curated_safe_big.is_starred is True
+
+    # Edge case from the user's screenshot: curated, deploy_safe by
+    # gate, but sample size too small for stable verdict (16 < 20).
+    # Pre-fix this would star — now it doesn't, avoiding the
+    # "⭐ but FAILS gates" UX inconsistency on the deep-link.
+    e_curated_safe_small = strategy_library.LibraryEntry(
+        strategy="s", ticker="X", tf="D1", long_only=True,
+        recommended=True, edge=es_safe_small,
+    )
+    assert e_curated_safe_small.is_starred is False
+
+    e_curated_unsafe = strategy_library.LibraryEntry(
+        strategy="s", ticker="X", tf="D1", long_only=True,
+        recommended=True, edge=es_unsafe,
+    )
+    assert e_curated_unsafe.is_starred is False
+
+    e_uncurated = strategy_library.LibraryEntry(
+        strategy="s", ticker="X", tf="D1", long_only=True,
+        recommended=False, edge=es_safe_big,
+    )
+    assert e_uncurated.is_starred is False
+
+    e_no_edge = strategy_library.LibraryEntry(
+        strategy="s", ticker="X", tf="D1", long_only=True,
+        recommended=True, edge=None,
+    )
+    assert e_no_edge.is_starred is False
 
 
 def test_list_library_returns_recommended_first(patch_grid):
@@ -79,11 +139,19 @@ def test_only_with_edge_filter_drops_non_survivors(patch_grid):
 
 
 def test_to_dataframe_has_expected_columns(patch_grid):
+    """The library DataFrame must surface the AlgoTest-style columns.
+
+    PF_train / R_train were dropped after the optimizer wide-format
+    migration — those numbers were always equal to PF_test / R_test in
+    optimizer rows anyway. The new $-amount columns replace them.
+    """
     lib = strategy_library.list_library()
     df = strategy_library.to_dataframe(lib)
-    expected = {"rec", "strategy", "ticker", "tf", "side",
-                 "n_test", "PF_test", "R_test",
-                 "PF_train", "R_train", "edge?", "why", "slug"}
+    expected = {"rec", "confidence", "strategy", "ticker", "tf", "side",
+                 "R:R", "n_test", "PF_test", "R_test",
+                 "win%", "netPnL$", "maxDD%", "maxDD$", "DDdays",
+                 "recovD", "rr", "avgWin$", "avgLoss$", "P(pass)",
+                 "edge?", "why", "slug"}
     assert expected.issubset(df.columns)
 
 
@@ -92,6 +160,8 @@ def test_empty_catalog_yields_empty_library(monkeypatch, tmp_path):
     can't be backed by stats)."""
     monkeypatch.setattr(edge_catalog, "DEFAULT_GRID_PATH",
                           tmp_path / "absent.md")
+    monkeypatch.setattr(edge_catalog, "DEFAULT_DB_PATH",
+                          tmp_path / "absent.db")
     lib = strategy_library.list_library()
     assert lib == []
 
@@ -108,11 +178,21 @@ def test_recommended_for_known_ticker_tf_present(patch_grid):
     assert found[0].edge.test_r > 0
 
 
-def test_dataframe_emoji_marker_only_on_recommended(patch_grid):
+def test_dataframe_emoji_marker_three_state(patch_grid):
+    """The `rec` column has three valid states:
+      ⭐  — curated AND deploy_safe AND n_test ≥ 20 (truly recommended)
+      📍  — curated but currently failing a hard gate (legacy / borderline)
+      ""  — uncurated cell from the broader sweep
+    Pre-fix this was a 2-state column (⭐ or "") which let cells with
+    16 OOS trades get ⭐ even though the Backtest deep-link would
+    flag them as failing — see is_starred docstring.
+    """
     df = strategy_library.to_dataframe(strategy_library.list_library())
-    rec_rows = df[df["rec"] == "⭐"]
-    other_rows = df[df["rec"] != "⭐"]
-    assert len(rec_rows) >= 1
-    # Every "rec" cell is either ⭐ or empty — never anything else
+    valid = {"⭐", "📍", ""}
     for v in df["rec"]:
-        assert v in ("⭐", "")
+        assert v in valid, f"unexpected rec value: {v!r}"
+    # SAMPLE_MD has small n_test values (8–13), so most curated rows
+    # land in the 📍 bucket rather than ⭐. That's fine — we just need
+    # SOME curated row visible.
+    n_curated = (df["rec"] == "⭐").sum() + (df["rec"] == "📍").sum()
+    assert n_curated >= 1

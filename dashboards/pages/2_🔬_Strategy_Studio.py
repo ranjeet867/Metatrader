@@ -64,14 +64,14 @@ def render_compare(strategies, data_index, side: str, label: str, cfg):
         enforce_w = st.checkbox("weekend flat", value=True, key=f"st_{side}_ew")
 
         if not st.button(f"▶  Run {label}", key=f"st_{side}_run",
-                          use_container_width=True):
+                          width="stretch"):
             return None
         try:
             df = load_parquet(data_index[ticker][tf])
             strat = StratCls() if params_obj is None else StratCls(params_obj)
             r = _backtest(df, strat,
                            balance=91_400, lots=DEFAULT_LOTS.get(ticker, 0.1),
-                           mpu=DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0),
+                           mpu=resolve_money_per_unit(ticker),
                            comm=comm, slip=slip, symbol=ticker,
                            enforce_weekend=enforce_w, enforce_daily=enforce_d)
         except Exception as e:
@@ -89,7 +89,7 @@ def render_compare(strategies, data_index, side: str, label: str, cfg):
         cols[2].metric("test PF", pf)
         st.plotly_chart(equity_figure(r.equity_curve, None, 91_400,
                                         f"{label}: {ticker} {tf} {sname}"),
-                         use_container_width=True)
+                         width="stretch")
         return {"result": r, "ticker": ticker, "tf": tf, "strat": sname}
 
 
@@ -135,7 +135,7 @@ def render_param_sweep(strategies, data_index):
             r = run_backtest(
                 df, strat.signals(df), starting_balance=91_400,
                 lots=DEFAULT_LOTS.get(ticker, 0.1),
-                money_per_unit_price=DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0),
+                money_per_unit_price=resolve_money_per_unit(ticker),
                 commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
                 symbol=ticker, enforce_daily_flat=True,
             )
@@ -163,8 +163,8 @@ def render_param_sweep(strategies, data_index):
         yaxis2=dict(title="test_R", overlaying="y", side="right"),
         height=380, margin=dict(l=10, r=10, t=40, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(df_s, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(df_s, width="stretch")
 
 
 def render_walk_forward(strategies, data_index):
@@ -196,7 +196,7 @@ def render_walk_forward(strategies, data_index):
             r = run_backtest(
                 sub, strat.signals(sub), starting_balance=91_400,
                 lots=DEFAULT_LOTS.get(ticker, 0.1),
-                money_per_unit_price=DEFAULT_MONEY_PER_UNIT.get(ticker, 1.0),
+                money_per_unit_price=resolve_money_per_unit(ticker),
                 commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
                 symbol=ticker, enforce_daily_flat=True,
             )
@@ -231,8 +231,8 @@ def render_walk_forward(strategies, data_index):
         yaxis2=dict(title="test_R", overlaying="y", side="right"),
         height=380, margin=dict(l=10, r=10, t=40, b=10),
     )
-    st.plotly_chart(fig, use_container_width=True)
-    st.dataframe(df_w, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+    st.dataframe(df_w, width="stretch")
 
 
 def render_new_strategy_wizard():

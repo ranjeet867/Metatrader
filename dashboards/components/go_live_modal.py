@@ -179,10 +179,10 @@ def render_modal(*, login: int, dep: Deployment, cfg,
 
     cols = st.columns(2)
     cancel = cols[0].button("Cancel", key=f"glm_cancel_{login}_{dep.deployment_id}",
-                                use_container_width=True)
+                                width="stretch")
     deploy = cols[1].button(
         "🚀  Go Live",
-        type="primary", use_container_width=True,
+        type="primary", width="stretch",
         disabled=not (all_ok and typed),
         key=f"glm_go_{login}_{dep.deployment_id}",
     )

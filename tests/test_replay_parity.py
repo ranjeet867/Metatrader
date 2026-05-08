@@ -167,3 +167,113 @@ def test_parity_with_slippage_us100_d1_vol_breakout(us100_d1):
     strat = VolBreakout(VolBreakoutParams(long_only=True))
     _check_parity(us100_d1, strat, money_per_unit=1.0, lots=1.0,
                   commission=3.0, slip=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Regression: M15 + bidirectional + full time-guard cfg.
+#
+# Before the core/parity_check.run_parity fix, ema_cross × US100.cash × M15
+# diverged by $2,068 because run_backtest was called with default
+# no_entry_minutes_before_close=0 while replay_run received the full
+# TimeGuardCfg with no_entry_minutes_before_close=30. At bar 2694
+# (bc_utc=20:00, exactly the index session close) replay's no-entry window
+# blocked a LONG entry while backtest's defaulted-off no-entry window let
+# it through — every later trade in the divergence chain followed.
+#
+# This test pins both engines to identical guard cfg via run_parity().
+# ---------------------------------------------------------------------------
+
+_US100_M15_PATH = REPO_ROOT / "data" / "US100.cash_M15.parquet"
+
+
+@pytest.mark.skipif(not _US100_M15_PATH.exists(),
+                     reason="requires US100.cash_M15.parquet "
+                            "(run `make refresh-data`)")
+def test_parity_m15_with_no_entry_window():
+    """ema_cross × US100.cash × M15 with no_entry_minutes_before_close=30
+    and daily_close_flat=True — both engines must take identical trades."""
+    from core.parity_check import run_parity
+    from core.time_guards import TimeGuardCfg
+
+    df = load_parquet(_US100_M15_PATH)
+    strat = EmaCross(EmaCrossParams())
+
+    tg = TimeGuardCfg(
+        weekend_flat_all=True,
+        daily_close_flat_classes=("stock", "index"),
+        us_session_close_hhmm="20:00",
+        flat_buffer_minutes=5,
+        no_entry_minutes_before_close=30,
+        asset_class_overrides=None,
+    )
+    pr = run_parity(
+        df, strat, symbol="US100.cash", tf="M15",
+        starting_balance=100_000.0, lots=1.0, money_per_unit_price=1.0,
+        commission_per_trade=3.0, slippage_per_fill_atr_frac=0.1,
+        tg_cfg=tg,
+    )
+    assert pr.bt.n_trades == pr.rp.n_trades, (
+        f"n_trades skew: bt={pr.bt.n_trades} rp={pr.rp.n_trades}"
+    )
+    assert pr.divergence_dollars < 0.01, (
+        f"PnL divergence ${pr.divergence_dollars:.4f}: "
+        f"bt=${pr.bt.sum_realized_pnl:+.4f} rp=${pr.rp.sum_realized_pnl:+.4f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression: replay must accept risk%-sizing (lots=0.0) without crashing.
+#
+# Before this fix, the Backtest page's "Run Replay-Parity" button passed
+# `lots=meta["lots"]` directly. When sizing_mode='risk %', `meta["lots"]` is
+# hard-coded 0.0 and PaperExecutor.open() raised BadSignalGeometry("lots
+# must be > 0; got 0.0"). The fix passes risk_pct + symbol_info instead,
+# letting replay size each trade dynamically — matching the run_backtest
+# behaviour. This test pins that contract.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not _US100_M15_PATH.exists(),
+                     reason="requires US100.cash_M15.parquet")
+def test_parity_with_risk_pct_sizing_lots_zero():
+    """When sizing_mode is risk%, replay must size dynamically off
+    risk_pct + symbol_info, NOT crash on lots=0.0."""
+    from core.parity_check import run_parity
+    from core.symbol_info_loader import try_load
+    from core.time_guards import TimeGuardCfg
+
+    df = load_parquet(_US100_M15_PATH)
+    strat = EmaCross(EmaCrossParams())
+    sym_info = try_load("US100.cash")
+    if sym_info is None:
+        pytest.skip("symbol_info missing for US100.cash — "
+                    "run `make refresh-symbol-info`")
+
+    tg = TimeGuardCfg(
+        weekend_flat_all=False,
+        daily_close_flat_classes=("stock", "index"),
+        us_session_close_hhmm="20:00",
+        flat_buffer_minutes=5,
+        no_entry_minutes_before_close=0,
+        asset_class_overrides=None,
+    )
+    # The smoking gun: pass lots=0.0 + risk_pct=0.3 + symbol_info.
+    # Pre-fix this would crash inside replay_run with BadSignalGeometry.
+    pr = run_parity(
+        df, strat, symbol="US100.cash", tf="M15",
+        starting_balance=100_000.0,
+        lots=0.0,                  # ← simulates risk%-sizing meta
+        money_per_unit_price=1.0,
+        commission_per_trade=4.0,
+        slippage_per_fill_atr_frac=0.05,
+        tg_cfg=tg,
+        risk_pct=0.3,
+        symbol_info=sym_info,
+    )
+    # Both engines must agree on n_trades + PnL within tolerance.
+    assert pr.bt.n_trades == pr.rp.n_trades, (
+        f"risk%-sizing parity skew: bt={pr.bt.n_trades} rp={pr.rp.n_trades}"
+    )
+    assert pr.divergence_dollars < 0.01, (
+        f"risk%-sizing PnL divergence ${pr.divergence_dollars:.4f}"
+    )
